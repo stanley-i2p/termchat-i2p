@@ -1,5 +1,11 @@
-import asyncio
+# Python 3.10+ compatibility
+# Use ./libi2p
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 import i2plib
+import i2plib.aiosam
+
+import asyncio
 from textual.app import App, ComposeResult
 from textual.widgets import Input, RichLog
 from textual.reactive import reactive
@@ -12,8 +18,6 @@ from rich import box
 from rich.align import Align
 from rich.table import Table
 from rich.text import Text
-import sys
-import os
 import time
 import pyperclip
 import base64
@@ -82,6 +86,10 @@ class I2PChat(App):
         self.sam_address = ('127.0.0.1', 7656)
         self.sock = None  # LISTENER
         self.conn = None  # ACTIVE CHAT
+        
+        # New i2plib requirement for GC
+        self.sam_reader = None
+        self.sam_writer = None
         
         self.stored_peer = None
         self.current_peer_addr = None
@@ -390,7 +398,8 @@ class I2PChat(App):
             self.my_dest = dest
             
             # Create SAM socket
-            await i2plib.create_session(
+            # New i2plib compatibility.
+            self.sam_reader, self.sam_writer = await i2plib.create_session(
                 self.session_id, 
                 destination=self.my_dest, 
                 sam_address=self.sam_address,
@@ -1020,6 +1029,13 @@ class I2PChat(App):
                 
             except:
                 pass
+            
+        try:
+            if self.sam_writer:
+                self.sam_writer.close()
+                await self.sam_writer.wait_closed()
+        except:
+            pass
 
 
 
