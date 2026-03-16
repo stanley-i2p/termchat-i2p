@@ -3,7 +3,6 @@
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 import i2plib
-import i2plib.aiosam
 
 import asyncio
 from textual.app import App, ComposeResult
