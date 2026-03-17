@@ -104,6 +104,15 @@ class I2PChat(App):
         self.incoming_expected = 0
         self.incoming_received = 0
         
+        self.outgoing_file = None
+        self.outgoing_filename = None
+        self.outgoing_total = 0
+        self.outgoing_sent = 0
+        
+        self.tx_start_time = None
+        self.rx_start_time = None
+        
+        
         self.image_buffer = []
         
         self.pending_messages = {}
@@ -164,8 +173,12 @@ class I2PChat(App):
         left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]"
 
         
+        transfer = self.get_file_transfer_status()
 
-        if is_active:
+        if transfer:
+            conn_viz = transfer
+
+        elif is_active:
             link_color = "green" if is_proven else "cyan"
             link_symbol = "●" if is_proven else "o"
             conn_viz = f"[bold {link_color}]{link_symbol}[/] [dim]CONNECTED[/]"
@@ -750,9 +763,11 @@ class I2PChat(App):
                         safe_name = os.path.join(FILE_DIR, f"recv_{msg_id}_{filename}")
                         
                         self.incoming_file = open(safe_name, "wb")
-                        self.incoming_filename = safe_name
+                        self.incoming_filename = filename # Just for display
                         self.incoming_expected = size
                         self.incoming_received = 0
+                        self.rx_start_time = time.time()
+                        self.watch_peer_b32(self.peer_b32)
 
                         self.post("system", f"Receiving file: {safe_name} ({size} bytes)")
 
@@ -767,6 +782,7 @@ class I2PChat(App):
                             chunk = base64.b64decode(payload)
 
                             self.incoming_received += len(chunk)
+                            self.watch_peer_b32(self.peer_b32)
 
                             if self.incoming_received > self.incoming_expected:
                                 self.post("error", "File transfer overflow detected")
@@ -794,6 +810,8 @@ class I2PChat(App):
                         self.incoming_filename = None
                         self.incoming_expected = 0
                         self.incoming_received = 0
+                        self.rx_start_time = None
+                        self.watch_peer_b32(self.peer_b32)
 
                 elif msg_type == 'S':
 
@@ -840,6 +858,10 @@ class I2PChat(App):
 
         finally:
             if self.conn == connection:
+                
+                self.reset_transfer_state()
+                self.watch_peer_b32(self.peer_b32)
+                
                 self.conn = None
                 self.post("disconnect", "Peer disconnected.")
                 self.peer_b32 = "Waiting for incoming connections..."
@@ -897,12 +919,19 @@ class I2PChat(App):
             filename = os.path.basename(path)
             filesize = os.path.getsize(path)
             
+            self.outgoing_file = True
+            self.outgoing_filename = filename
+            self.outgoing_total = filesize
+            self.outgoing_sent = 0
+            self.tx_start_time = time.time()
+            
             if filesize > MAX_FILE_SIZE:
                 self.post("error", f"File too large ({filesize} bytes)")
                 return
 
             self.post("system", f"Sending file: {filename} ({filesize} bytes)")
 
+            self.watch_peer_b32(self.peer_b32)
             
             header = f"{filename}|{filesize}"
             
@@ -914,8 +943,13 @@ class I2PChat(App):
             with open(path, "rb") as f:
                 while True:
                     chunk = f.read(4096)
+                    
                     if not chunk:
                         break
+
+                    self.outgoing_sent += len(chunk)
+                    
+                    
 
                     encoded = base64.b64encode(chunk).decode()
                     
@@ -923,14 +957,22 @@ class I2PChat(App):
                     writer.write(self.frame_message('C', cipher))
                     
                     await writer.drain()
+                    self.watch_peer_b32(self.peer_b32)
 
             # End transfer
             writer.write(self.frame_message('E', ''))
             await writer.drain()
 
             self.post("success", f"File sent: {filename}")
+            
+            self.outgoing_file = None
+            self.tx_start_time = None
+            
+            self.watch_peer_b32(self.peer_b32)
 
         except Exception as e:
+            self.reset_transfer_state()
+            self.watch_peer_b32(self.peer_b32)
             self.post("error", f"File transfer failed: {e}")
 
 
@@ -998,6 +1040,10 @@ class I2PChat(App):
     async def disconnect_peer(self):
         if self.conn:
             reader, writer = self.conn
+            
+            self.reset_transfer_state()
+            self.watch_peer_b32(self.peer_b32)
+            
             self.conn = None 
             self.peer_b32 = "Waiting for incoming connections..." 
             try:
@@ -1040,7 +1086,79 @@ class I2PChat(App):
 
     def safe_filename(name):
         return os.path.basename(name)
+    
+    
+    def reset_transfer_state(self):
+        # Outgoing
+        self.outgoing_file = None
+        self.outgoing_filename = None
+        self.outgoing_total = 0
+        self.outgoing_sent = 0
+        self.tx_start_time = None
 
+        # Incoming
+        if self.incoming_file:
+            try:
+                self.incoming_file.close()
+            except:
+                pass
+        
+        
+        self.incoming_file = None
+        self.incoming_filename = None
+        self.incoming_expected = 0
+        self.incoming_received = 0
+        self.rx_start_time = None
+    
+    
+    
+    def get_file_transfer_status(self):
+        # Will implement better status later on. Not critical.
+        now = time.time()
+        
+        # Outgoing
+        if self.outgoing_file and self.outgoing_total > 0:
+            pct = int((self.outgoing_sent / self.outgoing_total) * 100)
+            
+            speed = 0
+            if self.tx_start_time:
+                elapsed = now - self.tx_start_time
+                
+                if elapsed < 1.0:
+                    speed = 0
+                else:
+                    effective_time = max(elapsed, 0.5)
+
+                    speed = int(self.outgoing_sent / effective_time / 1024)
+                    
+            name = self.outgoing_filename[:12]
+            return f"[green]↑ {name} {pct}% {speed}KB/s[/]"
+
+        # Incoming
+        if self.incoming_file and self.incoming_expected > 0:
+            pct = int((self.incoming_received / self.incoming_expected) * 100)
+            
+            speed = 0
+            if self.rx_start_time:
+                elapsed = now - self.rx_start_time
+                
+                if elapsed < 1.0:
+                    speed =0
+                else:
+                    effective_time = max(elapsed, 0.5)
+
+                    speed = int(self.incoming_received / effective_time / 1024)
+                    
+            name = os.path.basename(self.incoming_filename)[:12]
+            return f"[cyan]↓ {name} {pct}% {speed}KB/s[/]"
+
+        return None
+
+
+    async def status_refresher(self):
+        while True:
+            self.watch_peer_b32(self.peer_b32)
+            await asyncio.sleep(0.2)
 
 
     def show_help(self):
