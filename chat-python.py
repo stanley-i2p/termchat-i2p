@@ -25,7 +25,9 @@ from PIL import Image
 
 import struct
 import random
+import hashlib
 
+from deaddrop import DeadDropClient
 from e2e import E2E
 
 
@@ -91,12 +93,18 @@ class I2PChat(App):
         self.sam_writer = None
         
         self.stored_peer = None
+        self.stored_peer_dest_b64 = None
         self.current_peer_addr = None
+        self.current_peer_dest_b64 = None
         self.profile = sys.argv[1] if len(sys.argv) > 1 else "default"
     
         # Generate a unique ID for THIS appinstance
         self.session_id = f"chat_{self.profile}_{int(time.time())}"
         self.proven = False  
+        
+        #deaddrops
+        self.dd_session_id = f"dd_{self.profile}_{int(time.time())}"
+        
         
         # File transfer states
         self.incoming_file = None
@@ -118,6 +126,35 @@ class I2PChat(App):
         self.pending_messages = {}
         
         self.e2e = E2E()
+        
+        # Dеaddrop (Phase 1)
+        self.deaddrop = DeadDropClient(
+            self.dd_session_id,
+            ["62afc5yf2lcthx44okvavvmvgb55cee3weqeqhuapcclz6evwyrq.b32.i2p"]
+        )
+        
+
+        
+        self.deaddrop_enabled = self.is_persistent_mode()
+        self.deaddrop_started = False
+        self.deaddrop_poller_started = False
+        self.offline_mode = False
+        
+        self.seen_drop_msgs = set()
+        
+        # OFFLINE key window state
+        
+        self.offline_shared_secret = b"CHANGE_ME_SHARED_OFFLINE_SECRET"
+
+        # One key per message
+        self.drop_send_index = 0
+
+        # Receiver window base
+        self.drop_recv_base = 0
+        self.drop_window = 8
+
+        # Tracks received consumed indexes
+        self.consumed_drop_recv = set()
 
 
     def compose(self) -> ComposeResult:
@@ -251,6 +288,8 @@ class I2PChat(App):
             #"system": "[bold yellow]SYSTEM:[/] [italic gray]{}[/]",
             "system": "[#878700]SYSTEM:[/] [dim #9f9f9f italic]{}[/]",
             "me": "[bold green]Me:[/] [white]{}[/]",
+            "me_offline": "[bold yellow]Me-Offline:[/] [white]{}[/]",
+            "peer_offline": "[bold magenta]Peer-Offline:[/] [white]{}[/]",
             "peer": "[bold cyan]Peer:[/] [white]{}[/]",
             "success": "[bold green]✔[/] [white]{}[/]",
             "disconnect": "[bold red]X[/] [white]{}[/]",
@@ -270,13 +309,26 @@ class I2PChat(App):
         
         
         
-        if type_name in ["me", "peer"]:
+        if type_name in ["me", "peer", "me_offline", "peer_offline"]:
             now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
             
             
-            box_color = "green" if type_name == "me" else "cyan"
-            display_name = "Me" if type_name == "me" else "Peer"
-            alignment = "left" if type_name == "me" else "right"
+            if type_name == "me":
+                box_color = "green"
+                display_name = "Me"
+                alignment = "left"
+            elif type_name == "peer":
+                box_color = "cyan"
+                display_name = "Peer"
+                alignment = "right"
+            elif type_name == "me_offline":
+                box_color = "yellow"
+                display_name = "Me-Offline"
+                alignment = "left"
+            else:
+                box_color = "magenta"
+                display_name = "Peer-Offline"
+                alignment = "right"
             
             
             message_panel = Panel(
@@ -334,7 +386,7 @@ class I2PChat(App):
         if version != PROTOCOL_VERSION:
             raise ValueError("Unsupported protocol version")
         
-        if msg_type not in b"UDISFCEKPO":
+        if msg_type not in b"UDISFCEKPOX":
             raise ValueError("Unknown frame type")
 
     
@@ -347,8 +399,291 @@ class I2PChat(App):
     
     
     
+    
+    def parse_frame_bytes(self, frame: bytes):
+        if len(frame) < 18:
+            raise ValueError("Frame too short")
+
+        magic, version, msg_type, msg_id, length = struct.unpack(">4sBcQI", frame[:18])
+
+        if magic != MAGIC:
+            raise ValueError("Invalid frame MAGIC")
+
+        if version != PROTOCOL_VERSION:
+            raise ValueError("Unsupported protocol version")
+
+        if msg_type not in b"UDISFCEKPOX":
+            raise ValueError("Unknown frame type")
+
+        if length < 0 or length > MAX_FRAME_SIZE:
+            raise ValueError("Invalid frame size")
+
+        if len(frame) != 18 + length:
+            raise ValueError("Frame length mismatch")
+
+        payload = frame[18:18 + length]
+
+        return msg_type.decode(), msg_id, payload
+    
+    
+    
     def generate_msg_id(self):
         return (int(time.time() * 1000) ^ random.getrandbits(32)) & 0xFFFFFFFFFFFFFFFF
+
+
+    def peer_dest_fingerprint(self, dest_b64: str) -> str:
+        return hashlib.sha256(dest_b64.encode()).hexdigest()[:16]
+
+
+    def peer_dest_matches_tofu(self, dest_b64: str) -> bool:
+        if not self.stored_peer_dest_b64:
+            return True
+        return dest_b64 == self.stored_peer_dest_b64
+
+
+    def get_offline_peer_b32(self):
+        peer = self.stored_peer or self.current_peer_addr
+        if not peer:
+            return None
+        return peer.replace(".b32.i2p", "").strip().lower()
+
+
+    def derive_deaddrop_key(self, direction: str, index: int) -> str:
+        if not hasattr(self, "my_dest"):
+            raise RuntimeError("Local destination not ready")
+
+        peer_b32 = self.get_offline_peer_b32()
+        if not peer_b32:
+            raise RuntimeError("Peer address not known for deaddrop key derivation")
+
+        my_b32 = self.my_dest.base32.strip().lower()
+
+        low_id, high_id = sorted([my_b32, peer_b32])
+
+        if my_b32 == low_id:
+            send_label = "LOW_TO_HIGH"
+            recv_label = "HIGH_TO_LOW"
+        else:
+            send_label = "HIGH_TO_LOW"
+            recv_label = "LOW_TO_HIGH"
+
+        if direction == "send":
+            dir_label = send_label
+        elif direction == "recv":
+            dir_label = recv_label
+        else:
+            raise ValueError("direction must be 'send' or 'recv'")
+
+        material = b"|".join([
+            self.offline_shared_secret,
+            low_id.encode(),
+            high_id.encode(),
+            dir_label.encode(),
+            str(index).encode(),
+        ])
+
+        return hashlib.sha256(material).hexdigest()
+
+
+    def next_deaddrop_send_key(self) -> str:
+        key = self.derive_deaddrop_key("send", self.drop_send_index)
+        self.drop_send_index += 1
+        return key
+
+
+    def get_deaddrop_recv_window(self):
+        keys = []
+        for i in range(self.drop_recv_base, self.drop_recv_base + self.drop_window):
+            if i in self.consumed_drop_recv:
+                continue
+            keys.append((i, self.derive_deaddrop_key("recv", i)))
+        return keys
+
+
+    def advance_drop_recv_base(self):
+        while self.drop_recv_base in self.consumed_drop_recv:
+            self.drop_recv_base += 1
+
+
+
+    def get_offline_blob_key(self):
+        if not hasattr(self, "my_dest"):
+            raise RuntimeError("Local destination not ready")
+
+        peer_b32 = self.get_offline_peer_b32()
+        if not peer_b32:
+            raise RuntimeError("Peer address not known for offline blob key")
+
+        my_b32 = self.my_dest.base32.strip().lower()
+
+        return self.e2e.derive_offline_blob_key(
+            self.offline_shared_secret,
+            my_b32,
+            peer_b32
+        )
+
+
+
+    def is_persistent_mode(self) -> bool:
+        return self.profile != "default"
+
+
+    def offline_ready(self) -> bool:
+        return (
+            self.is_persistent_mode()
+            and bool(self.stored_peer)
+            and self.deaddrop_enabled
+        )
+    
+    def leave_offline_mode(self):
+        self.offline_mode = False
+    
+    
+    def offline_state_path(self) -> str:
+        peer = self.get_offline_peer_b32()
+        if not peer:
+            raise RuntimeError("Locked peer not available for offline state path")
+
+        safe_peer = peer.replace("/", "_")
+        return os.path.join(PROFILE_DIR, f"offline_{safe_peer}.state")
+
+
+    def load_offline_state(self):
+        if not self.offline_ready():
+            return
+
+        path = self.offline_state_path()
+
+        if not os.path.exists(path):
+            return
+
+        try:
+            with open(path, "r") as f:
+                lines = [line.strip() for line in f.readlines() if line.strip()]
+
+            data = {}
+
+            for line in lines:
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                data[k.strip()] = v.strip()
+
+            if "offline_shared_secret" in data:
+                try:
+                    self.offline_shared_secret = bytes.fromhex(data["offline_shared_secret"])
+                except:
+                    self.offline_shared_secret = b"CHANGE_ME_SHARED_OFFLINE_SECRET"
+
+            if "drop_send_index" in data:
+                self.drop_send_index = int(data["drop_send_index"])
+
+            if "drop_recv_base" in data:
+                self.drop_recv_base = int(data["drop_recv_base"])
+
+            if "drop_window" in data:
+                self.drop_window = int(data["drop_window"])
+
+            if "consumed_drop_recv" in data and data["consumed_drop_recv"]:
+                self.consumed_drop_recv = set(
+                    int(x) for x in data["consumed_drop_recv"].split(",") if x.strip()
+                )
+            else:
+                self.consumed_drop_recv = set()
+
+            self.post("system", f"Loaded offline state for [cyan]{self.stored_peer}[/]")
+
+        except Exception as e:
+            self.post("error", f"Failed to load offline state: {e}")
+
+
+    def save_offline_state(self):
+        if not self.offline_ready():
+            return
+
+        try:
+            path = self.offline_state_path()
+
+            with open(path, "w") as f:
+                f.write(f"offline_shared_secret={self.offline_shared_secret.hex()}\n")
+                f.write(f"drop_send_index={self.drop_send_index}\n")
+                f.write(f"drop_recv_base={self.drop_recv_base}\n")
+                f.write(f"drop_window={self.drop_window}\n")
+                f.write(
+                    "consumed_drop_recv="
+                    + ",".join(str(x) for x in sorted(self.consumed_drop_recv))
+                    + "\n"
+                )
+
+        except Exception as e:
+            self.post("error", f"Failed to save offline state: {e}")
+
+
+    
+    def has_real_offline_secret(self) -> bool:
+        return self.offline_shared_secret != b"CHANGE_ME_SHARED_OFFLINE_SECRET"
+
+
+    def generate_offline_shared_secret(self) -> bytes:
+        return os.urandom(32)
+    
+    
+    def should_initiate_offline_secret(self) -> bool:
+        if not hasattr(self, "my_dest"):
+            return False
+
+        peer_b32 = self.get_offline_peer_b32()
+        if not peer_b32:
+            return False
+
+        my_b32 = self.my_dest.base32.strip().lower()
+        peer_b32 = peer_b32.strip().lower()
+
+        return my_b32 < peer_b32
+
+
+    async def send_offline_secret_if_needed(self):
+        if not self.conn:
+            return
+
+        if not self.offline_ready():
+            return
+
+        if self.has_real_offline_secret():
+            return
+        
+        if not self.should_initiate_offline_secret():
+            return
+
+        try:
+            _, writer = self.conn
+
+            self.offline_shared_secret = self.generate_offline_shared_secret()
+            self.save_offline_state()
+
+            writer.write(self.frame_message('X', self.offline_shared_secret))
+            await writer.drain()
+
+            self.post("system", "Offline secret sent to locked peer.")
+        except Exception as e:
+            self.post("error", f"Failed to send offline secret: {e}")
+
+
+
+    async def ensure_offline_runtime_started(self):
+        if not self.offline_ready():
+            return
+
+        if not self.deaddrop_started:
+            await self.deaddrop.start()
+            self.deaddrop_started = True
+            # Deaddrop test
+            #asyncio.create_task(self.test_drop())
+
+        if not self.deaddrop_poller_started:
+            self.run_worker(self.poll_deaddrops())
+            self.deaddrop_poller_started = True
+
 
 
 
@@ -363,7 +698,7 @@ class I2PChat(App):
         
         
         self.post("system", "Initializing SAM Session...")
-        self.post("system", f"Initializing Profile: [bold yellow]{self.profile}[/]")
+        self.post("system", f"Initializing Profile: {self.profile}")
         
         
         
@@ -394,6 +729,14 @@ class I2PChat(App):
                     self.stored_peer = lines[1]
                     self.post("system", f"Stored Contact: [cyan]{self.stored_peer}.b32.i2p[/]")
                     
+                    
+                if len(lines) > 2:
+                    self.stored_peer_dest_b64 = lines[2]
+                    fp = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
+                    self.post("system", f"TOFU peer pin loaded: [cyan]{fp}[/]")
+                    
+                    
+                    
             # Generate new
             if dest is None:
                 self.post("system", "Generating new Ed25519 identity...")
@@ -423,6 +766,8 @@ class I2PChat(App):
                 }
             )
             
+            
+            
 
             self.network_status = "local_ok"
             my_address = self.my_dest.base32 + ".b32.i2p"
@@ -431,12 +776,27 @@ class I2PChat(App):
             self.peer_b32 = f"My Addr: {my_address}"
             
             if self.stored_peer:
+                
+                self.load_offline_state()
+                
                 self.post("system", "Type [bold yellow]/connect[/] to dial stored contact.")
                 self.post("system", "Waiting for incoming connections...")
             else:
                 self.post("system", "Waiting for incoming connections...")
 
             self.run_worker(self.accept_loop())
+            
+            if self.offline_ready():
+                # Start Deaddrop raw SAM session
+                await self.deaddrop.start()
+                self.deaddrop_started = True
+
+                # Deaddrop poller
+                self.run_worker(self.poll_deaddrops())
+                self.deaddrop_poller_started = True
+
+                # Deaddrop connect test
+                #asyncio.create_task(self.test_drop())
             
             
         except Exception as e:
@@ -454,10 +814,30 @@ class I2PChat(App):
         if not msg: return
         event.input.value = ""
 
+
+        if msg.strip() == "/offline":
+            if self.conn:
+                self.post("error", "Cannot enter offline mode during active live chat.")
+                return
+
+            if not self.offline_ready():
+                self.post("error", "Offline mode requires persistent mode with a locked peer.")
+                return
+
+            self.offline_mode = True
+            self.post("system", "Entered OFFLINE mode.")
+            return
+
+
         if msg.startswith("/connect"):
             if self.conn:
                 self.post("error", "Already connected. Use /disconnect first.")
                 return
+            
+            if self.offline_mode:
+                self.leave_offline_mode()
+                self.post("system", "Leaving OFFLINE mode.")
+            
             parts = msg.split(" ")
             if len(parts) > 1:
                 # User provided address
@@ -490,10 +870,30 @@ class I2PChat(App):
                 key_file = os.path.join(PROFILE_DIR, f"{self.profile}.dat")
                 
                 try:
+                    if not self.current_peer_dest_b64:
+                        self.post("error", "Peer full destination not yet known for TOFU pinning.")
+                        return
+
                     with open(key_file, "a") as f:
                         f.write(self.current_peer_addr + "\n")
+                        f.write(self.current_peer_dest_b64 + "\n")
+
                     self.stored_peer = self.current_peer_addr
+                    self.stored_peer_dest_b64 = self.current_peer_dest_b64
+
+                    # Initialize and persist offline state for this locked peer
+                    self.drop_send_index = 0
+                    self.drop_recv_base = 0
+                    self.drop_window = 8
+                    self.consumed_drop_recv = set()
+
+                    self.save_offline_state()
+
+                    await self.ensure_offline_runtime_started()
+
+                    fp = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
                     self.post("success", f"Identity [bold yellow]{self.profile}[/] is now locked to this peer.")
+                    self.post("system", f"TOFU peer pin saved: [cyan]{fp}[/]")
                 except Exception as e:
                     self.post("error", f"Failed to save: {e}")
             else:
@@ -567,13 +967,37 @@ class I2PChat(App):
 
                 writer.write(frame)
                 await writer.drain()
+                
 
                 self.post("me", msg)
             except Exception:
                 self.post("error", "Failed to send message.")
                 self.conn = None
+                
+        elif self.offline_ready() and self.offline_mode:
+            try:
+                frame = self.frame_message('U', msg.encode())
+                dd_key = self.next_deaddrop_send_key()
+                blob_key = self.get_offline_blob_key()
+                blob = self.e2e.encrypt_offline_blob(frame, blob_key)
+
+                await self.deaddrop.put(dd_key, blob)
+                self.save_offline_state()
+
+                self.post("me_offline", msg)
+                self.post("system", f"[OFFLINE] queued via deaddrop key_index={self.drop_send_index - 1}")
+
+            except Exception as e:
+                self.post("error", f"[OFFLINE send failed] {e}")
+                
+                
         else:
-            self.post("error", "No active connection. Use /connect <address>")
+            if self.is_persistent_mode() and not self.stored_peer:
+                self.post("error", "Offline messaging requires a locked peer in persistent mode.")
+            else:
+                self.post("error", "No active connection. Use /connect <address>")
+                
+        
             
             
             
@@ -589,7 +1013,7 @@ class I2PChat(App):
             
             
             if hasattr(self, 'my_dest'):
-                # Send the raw B64 address in single line
+                # Send raw B64 address in single line
                 writer.write(self.my_dest.base64.encode() + b"\n")
                 # Send 'S' frame to sync state machine
                 writer.write(self.frame_message('S', self.my_dest.base64))
@@ -646,9 +1070,18 @@ class I2PChat(App):
                     raw_dest = peer_identity_line.decode().strip()
                     peer_addr = i2plib.Destination(raw_dest).base32 + ".b32.i2p"
                     
-                    # If profile is LOCKED, verify the calling peer
+                    # If profile is LOCKED, verify calling peer b32
                     if self.stored_peer and peer_addr != self.stored_peer:
                         self.post("error", f"Blocked unauthorized call from {peer_addr}...")
+                        writer.close()
+                        continue
+                    
+                    
+                    # TOFU check on b64 destination if pinned
+                    if self.stored_peer_dest_b64 and raw_dest != self.stored_peer_dest_b64:
+                        fp_old = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
+                        fp_new = self.peer_dest_fingerprint(raw_dest)
+                        self.post("error", f"TOFU mismatch for {peer_addr}: expected {fp_old}, got {fp_new}")
                         writer.close()
                         continue
                  
@@ -668,7 +1101,13 @@ class I2PChat(App):
                     writer.write(self.frame_message('K', self.e2e.public_bytes()))
                     await writer.drain()
 
+
+                if self.offline_mode:
+                    self.leave_offline_mode()
+                    self.post("system", "Leaving OFFLINE mode due to live incoming connection.")
+
                 self.conn = (reader, writer)
+
                 
                 # Start receiver
                 self.run_worker(self.receive_loop(self.conn))
@@ -699,156 +1138,9 @@ class I2PChat(App):
                     # Invalid frame then resync
                     continue
 
-                body = payload.decode('utf-8', errors="ignore")
-
-                # Routing block
-                if msg_type == 'U':
-                    self.post("peer", body)
-                    
-                    writer.write(
-                        self.frame_message(
-                        'D',
-                        struct.pack(">Q", msg_id)
-                        )
-                    )
-                    await writer.drain()
-                    
-                elif msg_type == 'D':
-
-                    delivered_id = struct.unpack(">Q", payload)[0]
-
-                    if delivered_id in self.pending_messages:
-
-                        msg = self.pending_messages.pop(delivered_id)
-
-                        
-                        self.chat_log.write(Align("[dim green] ✓ [/]", align="left"),
-                        expand=True)
-
-                elif msg_type == 'I':
-
-                    if body == "__END__":
-
-                        now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
-
-                        img_text = "\n".join(self.image_buffer)
-
-                        message_panel = Panel(
-                            img_text,
-                            title=f"[#5f5f5f][{now_utc} UTC][/] [bold cyan]Peer[/]",
-                            title_align="left",
-                            border_style="cyan",
-                            box=box.ROUNDED,
-                            expand=False
-                        )
-
-                        self.chat_log.write(Align(message_panel, align="right"), expand=True)
-
-                        self.image_buffer = []
-
-                    else:
-                        if len(self.image_buffer) < MAX_IMAGE_LINES:
-                            self.image_buffer.append(body)
-
-                elif msg_type == 'F':
-                    try:
-                        filename, size = body.split("|")
-                        filename = os.path.basename(filename)[:MAX_FILENAME]
-                        size = int(size)
-                        
-                        if size > MAX_FILE_SIZE:
-                            self.post("error", f"File rejected (too large: {size} bytes)")
-                            return
-
-                        safe_name = os.path.join(FILE_DIR, f"recv_{msg_id}_{filename}")
-                        
-                        self.incoming_file = open(safe_name, "wb")
-                        self.incoming_filename = filename # Just for display
-                        self.incoming_expected = size
-                        self.incoming_received = 0
-                        self.rx_start_time = time.time()
-                        self.watch_peer_b32(self.peer_b32)
-
-                        self.post("system", f"Receiving file: {safe_name} ({size} bytes)")
-
-                    except Exception as e:
-                        self.post("error", f"Invalid file header: {e}")
-
-                elif msg_type == 'C':
-
-                    try:
-                        if self.incoming_file:
-
-                            chunk = base64.b64decode(payload)
-
-                            self.incoming_received += len(chunk)
-                            self.watch_peer_b32(self.peer_b32)
-
-                            if self.incoming_received > self.incoming_expected:
-                                self.post("error", "File transfer overflow detected")
-                                self.incoming_file.close()
-                                self.incoming_file = None
-                                return
-
-                            self.incoming_file.write(chunk)
-
-                    except Exception as e:
-                        self.post("error", f"File chunk error: {e}")
-
-                elif msg_type == 'E':
-
-                    if self.incoming_file:
-
-                        self.incoming_file.close()
-
-                        self.post(
-                            "success",
-                            f"File received: {self.incoming_filename} ({self.incoming_received} bytes)"
-                        )
-
-                        self.incoming_file = None
-                        self.incoming_filename = None
-                        self.incoming_expected = 0
-                        self.incoming_received = 0
-                        self.rx_start_time = None
-                        self.watch_peer_b32(self.peer_b32)
-
-                elif msg_type == 'S':
-
-                    if "__SIGNAL__:" in body:
-
-                        if "QUIT" in body:
-                            self.post("system", "Peer requested disconnect.")
-                            break
-
-                    else:
-
-                        try:
-                            dest_obj = i2plib.Destination(body)
-
-                            self.peer_b32 = dest_obj.base32 + ".b32.i2p"
-                            peer_addr = self.peer_b32
-
-                            self.post("info", f"Peer Identity: {peer_addr}")
-
-                        except:
-                            pass
-                        
-                        
-                elif msg_type == 'K':
-
-                    try:
-                        self.e2e.receive_peer_key(payload)
-                        self.post("system", "Secure session established 🔐")
-                    except Exception as e:
-                        self.post("error", f"E2E key error: {e}")
-                        
-
-                elif msg_type == 'P':
-
-                    writer.write(self.frame_message('O', b''))
-                    await writer.drain()
-
+                await self.handle_parsed_frame(msg_type, msg_id, payload, writer=writer, source="live")
+                
+                
         except (asyncio.IncompleteReadError, ConnectionResetError):
             pass
 
@@ -863,6 +1155,7 @@ class I2PChat(App):
                 self.watch_peer_b32(self.peer_b32)
                 
                 self.conn = None
+                self.current_peer_dest_b64 = None
                 self.post("disconnect", "Peer disconnected.")
                 self.peer_b32 = "Waiting for incoming connections..."
                 self.post("system", "Waiting for incoming connections...")
@@ -872,6 +1165,201 @@ class I2PChat(App):
                 await writer.wait_closed()
             except:
                 pass
+
+
+
+
+    async def handle_parsed_frame(self, msg_type, msg_id, payload, writer=None, source="live"):
+        body = payload.decode('utf-8', errors="ignore")
+
+        if msg_type == 'U':
+            bubble_type = "peer_offline" if source == "drop" else "peer"
+            self.post(bubble_type, body)
+
+            if writer is not None:
+                writer.write(
+                    self.frame_message(
+                        'D',
+                        struct.pack(">Q", msg_id)
+                    )
+                )
+                await writer.drain()
+
+        elif msg_type == 'D':
+            delivered_id = struct.unpack(">Q", payload)[0]
+
+            if delivered_id in self.pending_messages:
+                msg = self.pending_messages.pop(delivered_id)
+
+                self.chat_log.write(
+                    Align("[dim green] ✓ [/]", align="left"),
+                    expand=True
+                )
+
+        elif msg_type == 'I':
+
+            if body == "__END__":
+
+                now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                img_text = "\n".join(self.image_buffer)
+
+                message_panel = Panel(
+                    img_text,
+                    title=f"[#5f5f5f][{now_utc} UTC][/] [bold cyan]Peer[/]",
+                    title_align="left",
+                    border_style="cyan",
+                    box=box.ROUNDED,
+                    expand=False
+                )
+
+                self.chat_log.write(Align(message_panel, align="right"), expand=True)
+                self.image_buffer = []
+
+            else:
+                if len(self.image_buffer) < MAX_IMAGE_LINES:
+                    self.image_buffer.append(body)
+
+        elif msg_type == 'F':
+            try:
+                filename, size = body.split("|")
+                filename = os.path.basename(filename)[:MAX_FILENAME]
+                size = int(size)
+
+                if size > MAX_FILE_SIZE:
+                    self.post("error", f"File rejected (too large: {size} bytes)")
+                    return
+
+                safe_name = os.path.join(FILE_DIR, f"recv_{msg_id}_{filename}")
+
+                self.incoming_file = open(safe_name, "wb")
+                self.incoming_filename = filename
+                self.incoming_expected = size
+                self.incoming_received = 0
+                self.rx_start_time = time.time()
+                self.watch_peer_b32(self.peer_b32)
+
+                self.post("system", f"Receiving file: {safe_name} ({size} bytes)")
+
+            except Exception as e:
+                self.post("error", f"Invalid file header: {e}")
+
+        elif msg_type == 'C':
+            try:
+                if self.incoming_file:
+                    chunk = base64.b64decode(payload)
+
+                    self.incoming_received += len(chunk)
+                    self.watch_peer_b32(self.peer_b32)
+
+                    if self.incoming_received > self.incoming_expected:
+                        self.post("error", "File transfer overflow detected")
+                        self.incoming_file.close()
+                        self.incoming_file = None
+                        return
+
+                    self.incoming_file.write(chunk)
+
+            except Exception as e:
+                self.post("error", f"File chunk error: {e}")
+
+        elif msg_type == 'E':
+
+            if self.incoming_file:
+                self.incoming_file.close()
+
+                self.post(
+                    "success",
+                    f"File received: {self.incoming_filename} ({self.incoming_received} bytes)"
+                )
+
+                self.incoming_file = None
+                self.incoming_filename = None
+                self.incoming_expected = 0
+                self.incoming_received = 0
+                self.rx_start_time = None
+                self.watch_peer_b32(self.peer_b32)
+
+        elif msg_type == 'S':
+
+            if "__SIGNAL__:" in body:
+
+                if "QUIT" in body:
+                    self.post("system", "Peer requested disconnect.")
+
+            else:
+                try:
+                    dest_obj = i2plib.Destination(body)
+                    peer_addr = dest_obj.base32 + ".b32.i2p"
+
+                    if self.stored_peer and peer_addr != self.stored_peer:
+                        self.post("error", f"Locked peer mismatch: {peer_addr}")
+                        if self.conn and writer is not None:
+                            try:
+                                writer.close()
+                                await writer.wait_closed()
+                            except:
+                                pass
+                        return
+
+                    if self.stored_peer_dest_b64 and body != self.stored_peer_dest_b64:
+                        fp_old = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
+                        fp_new = self.peer_dest_fingerprint(body)
+                        self.post("error", f"TOFU mismatch for {peer_addr}: expected {fp_old}, got {fp_new}")
+                        if self.conn and writer is not None:
+                            try:
+                                writer.close()
+                                await writer.wait_closed()
+                            except:
+                                pass
+                        return
+
+                    self.current_peer_addr = peer_addr
+                    self.current_peer_dest_b64 = body
+                    self.peer_b32 = peer_addr
+
+                    fp = self.peer_dest_fingerprint(body)
+                    self.post("info", f"Peer Identity: {peer_addr} [dim](TOFU {fp})[/]")
+
+                except:
+                    pass
+
+        elif msg_type == 'K':
+            try:
+                self.e2e.receive_peer_key(payload)
+                self.post("system", "Secure session established 🔐")
+                
+                if self.offline_ready():
+                    asyncio.create_task(self.send_offline_secret_if_needed())
+                
+            except Exception as e:
+                self.post("error", f"E2E key error: {e}")
+                
+                
+        elif msg_type == 'X':
+            try:
+                if not self.offline_ready():
+                    self.post("error", "Received offline secret outside persistent locked-peer mode.")
+                    return
+
+                if len(payload) != 32:
+                    self.post("error", "Invalid offline secret length.")
+                    return
+
+                if self.has_real_offline_secret():
+                    self.post("system", "Offline secret already exists. Ignoring replacement.")
+                    return
+
+                self.offline_shared_secret = payload
+                self.save_offline_state()
+                self.post("system", "Offline secret received and saved.")
+            except Exception as e:
+                self.post("error", f"Offline secret handling failed: {e}")
+                
+
+        elif msg_type == 'P':
+            if writer is not None:
+                writer.write(self.frame_message('O', b''))
+                await writer.drain()
 
 
 
@@ -1044,7 +1532,8 @@ class I2PChat(App):
             self.reset_transfer_state()
             self.watch_peer_b32(self.peer_b32)
             
-            self.conn = None 
+            self.conn = None
+            self.current_peer_dest_b64 = None
             self.peer_b32 = "Waiting for incoming connections..." 
             try:
                 
@@ -1063,6 +1552,11 @@ class I2PChat(App):
 
     async def on_unmount(self):
         
+        try:
+            self.save_offline_state()
+        except:
+            pass
+        
         if self.conn:
             try:
                 
@@ -1079,6 +1573,13 @@ class I2PChat(App):
             if self.sam_writer:
                 self.sam_writer.close()
                 await self.sam_writer.wait_closed()
+        except:
+            pass
+        
+        
+        # Deaddrop SAM cleanup
+        try:
+            await self.deaddrop.close()
         except:
             pass
 
@@ -1161,6 +1662,92 @@ class I2PChat(App):
             await asyncio.sleep(0.2)
 
 
+
+    async def poll_deaddrops(self):
+        await asyncio.sleep(2)  # let client fully start
+
+        while True:
+            try:
+                if not self.offline_ready() or not self.offline_mode:
+                    await asyncio.sleep(5)
+                    continue
+                
+                
+                if not hasattr(self, "my_dest"):
+                    await asyncio.sleep(5)
+                    continue
+
+                if not self.get_offline_peer_b32():
+                    await asyncio.sleep(5)
+                    continue
+
+                recv_window = self.get_deaddrop_recv_window()
+                blob_key = self.get_offline_blob_key()
+
+                for recv_index, dd_key in recv_window:
+                    try:
+                        blobs = await self.deaddrop.get(dd_key)
+
+                        if not blobs:
+                            continue
+
+                        got_valid_blob = False
+
+                        for blob in blobs:
+                            try:
+                                blob_hash = hashlib.sha256(blob).hexdigest()
+
+                                if blob_hash in self.seen_drop_msgs:
+                                    continue
+
+                                frame = self.e2e.decrypt_offline_blob(blob, blob_key)
+                                msg_type, msg_id, payload = self.parse_frame_bytes(frame)
+
+                                self.seen_drop_msgs.add(blob_hash)
+                                got_valid_blob = True
+
+                                await self.handle_parsed_frame(
+                                    msg_type,
+                                    msg_id,
+                                    payload,
+                                    writer=None,
+                                    source="drop"
+                                )
+
+                                self.post("system", f"[DROP] received type={msg_type} msg_id={msg_id} key_index={recv_index}")
+
+                            except Exception as e:
+                                self.post("error", f"[DROP parse error] {e}")
+
+                        if got_valid_blob:
+                            self.consumed_drop_recv.add(recv_index)
+                            self.advance_drop_recv_base()
+                            self.save_offline_state()
+
+                    except Exception as e:
+                        self.post("error", f"[DROP key poll error] {e}")
+
+            except Exception as e:
+                self.post("error", f"[DROP polling error] {e}")
+
+            await asyncio.sleep(5)
+
+
+
+    async def test_drop(self):
+        self.post("system", "Connecting to deaddrop...")
+        await asyncio.sleep(5)
+
+        self.post("system", "[TEST] starting deaddrop PUT")
+
+        try:
+            await self.deaddrop.put("test", b"hello_drop")
+            self.post("success", "[TEST] PUT completed")
+        except Exception as e:
+            self.post("error", f"[TEST] PUT failed: {e}")
+
+
+
     def show_help(self):
 
         self.post("help", "Available commands:")
@@ -1171,6 +1758,7 @@ class I2PChat(App):
 
         self.post("help", "Messaging:")
         self.post("help", "  Type text and press ENTER to send message")
+        self.post("help", "  /offline                 Enter offline messaging mode (persistent locked peer only)")
         
         self.post("help", "Identity:")
         self.post("help", "  /save                    Save identity (not available in TRANSIENT mode)")
