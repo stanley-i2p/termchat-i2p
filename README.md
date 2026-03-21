@@ -22,6 +22,7 @@ As a result, the messenger aims to provide strong privacy, low metadata exposure
 - This project is being developed in **multiple phases**, and a number of features and refinements are still planned for later stages.
 - At the current stage, the **core architecture is already in place**, including most of the important **security mechanisms** and the full **offline messaging foundation**.
 - The main work that remains is largely around **interface beautification**, usability polish, and smaller supporting features rather than the core privacy model.
+- Additional work is being done for offline replication as well as for offline server lists exchange protocol (natual diffusion model).
 - After broader real-world testing and possible **security review / audit**, we are considering a future **rewrite in C++**.
 - In the longer term, the Python version is also expected to **move away from `libi2p` entirely** in favor of a cleaner and more controlled implementation path.
 
