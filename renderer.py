@@ -6,8 +6,6 @@ from PIL import ImageOps
 
 # Terminal capability detection. Implement later if needed.
 
-# Wezterm, Kitty local rendering did not work. Commenting OUT for now.
-
 def terminal_supports_native():
 
     # term_program = os.environ.get("TERM_PROGRAM", "").lower()
@@ -111,7 +109,7 @@ def render_braille(path, width=70):
     # contrast normalization :)
     img = ImageOps.autocontrast(img)
 
-    #Floyd-Steinberg dithering. Needs work.
+    # Floyd–Steinberg dithering. Needs work.
     #img = img.convert("1", dither=Image.FLOYDSTEINBERG).convert("L")
 
     w, h = img.size
