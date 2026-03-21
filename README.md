@@ -1,3 +1,28 @@
+## TermChatI2P
+
+TermChatI2P is a terminal-based private messenger designed for one-to-one communication over the I2P network.  
+It supports both **live encrypted chat** and **offline messaging**, while keeping the protocol compact and operationally simple.  
+The application has two modes: **transient mode** for short-lived live sessions, and **persistent mode** for long-term trusted peers with saved identity and offline support.  
+Live messages use an internal framed protocol and an additional end-to-end encryption layer on top of I2P transport.  
+Persistent mode can lock a profile to a single peer, store offline messaging state, and exchange queued messages through minimal deaddrop servers.  
+Offline delivery uses opaque encrypted blobs and rotating per-message lookup keys, so the storage layer learns very little.  
+Peer trust in persistent mode is strengthened with **TOFU (Trust On First Use)** by pinning the peer’s full I2P destination identity for future verification.  
+The design emphasizes compartmentalization: live chat, offline delivery, persistent trust, and transient sessions are intentionally separated.  
+As a result, the messenger aims to provide strong privacy, low metadata exposure, and practical offline capability without relying on heavy server-side logic.
+
+## Project Status
+
+- This project is being developed in **multiple phases**, and a number of features and refinements are still planned for later stages.
+- At the current stage, the **core architecture is already in place**, including most of the important **security mechanisms** and the full **offline messaging foundation**.
+- The main work that remains is largely around **interface beautification**, usability polish, and smaller supporting features rather than the core privacy model.
+- After broader real-world testing and possible **security review / audit**, we are considering a future **rewrite in C++**.
+- In the longer term, the Python version is also expected to **move away from `libi2p` entirely** in favor of a cleaner and more controlled implementation path.
+
+
+
+
+
+
 ## TermchatI2P: Децентрализованный защищенный мессенджер
 
 TermchatI2P — это консольный (TUI) мессенджер, работающий через анонимную сеть **I2P (Invisible Internet Project)**. Проект ориентирован на максимальную приватность, исключая центральные сервера и метаданные.
@@ -314,4 +339,217 @@ __SIGNAL__:TYPING
 транспортным уровнем.
 
 
+# Offline Messaging Architecture
 
+## Overview
+
+This chat has two operating modes:
+
+- **Transient mode**
+  - live 1:1 chat only
+  - no offline deaddrop messaging by default
+
+- **Persistent mode**
+  - identity is stored locally
+  - peer is locked to a saved `.b32.i2p`
+  - offline messaging is enabled
+  - offline state is stored per locked peer
+
+All communication runs over **I2P**.
+
+---
+
+# Offline Messaging Architecture
+
+## Overview
+
+This chat has two operating modes:
+
+- **Transient mode**
+  - live 1:1 chat only
+  - no offline deaddrop messaging by default
+
+- **Persistent mode**
+  - identity is stored locally
+  - peer is locked to a saved `.b32.i2p`
+  - offline messaging is enabled
+  - offline state is stored per locked peer
+
+All communication runs over **I2P**.
+
+---
+
+## Live Protocol
+
+The inner application frame is:
+
+```bash
+MAGIC | VERSION | TYPE | MSG_ID | LEN | PAYLOAD
+```
+This frame is used for normal live 1:1 communication and is also the payload carried inside offline blobs.
+
+### Offline Blob Format
+
+Offline blobs are intentionally inert and contain no metadata:
+
+```bash
+nonce | enc(nonce, frame)
+```
+Where:
+    - frame is the normal inner app protocol frame
+    - nonce is per-message
+    - encrypted blob contains no sender, recipient, timestamp, or routing metadata
+
+### Deaddrop Model
+
+Offline delivery uses a deaddrop server with a very small protocol:
+
+```bash
+PUT <key> <size>
+GET <key>
+```
+Properties:
+    - one key = one blob
+    - server stores opaque bytes only
+    - server does not parse chat protocol
+    - overwrite is refused
+    - server may return EXISTS
+    - expired blobs are removed by TTL/GC
+
+### Offline Keying
+
+Each offline message uses a derived per-message key.
+
+Conceptually:
+
+```bash
+key_i = KDF(offline_shared_secret, peer identities, direction, index)
+```
+Properties:
+    - one derived key per message
+    - sender advances send index
+    - receiver searches a bounded receive window
+    - no mailbox-style multi-message bucket
+    - stronger compartmentalization and less linkability
+
+### Offline Receive Flow
+
+In persistent mode, when offline runtime is active:
+* compute receive key window
+* GET each candidate key
+* if blob exists:
+  - hash-check duplicate
+  - decrypt blob
+  - recover inner frame
+  - parse normal app protocol frame
+  - process through normal frame handler
+  - mark receive index consumed
+  - advance receive base
+  - persist updated offline state
+
+### Offline Send Flow
+
+If no live connection exists and offline mode is active:
+* build normal inner frame
+```bash
+MAGIC | VERSION | TYPE | MSG_ID | LEN | PAYLOAD
+```
+* wrap as offline blob
+* nonce | enc(nonce, frame)
+* derive next send key
+* PUT blob to deaddrop
+* increment send index
+* persist updated offline state
+
+### Offline Runtime Rules
+
+Persistent mode
+* offline messaging enabled
+* locked peer required
+* offline secret stored per locked peer
+* send/receive counters stored per locked peer
+* receive window state stored per locked peer
+
+Transient mode
+* live chat only
+* no offline deaddrop by default
+
+### Offline State
+
+Per locked peer, persistent mode stores:
+* offline_shared_secret
+* drop_send_index
+* drop_recv_base
+* drop_window
+* consumed receive indexes
+
+This allows restart-safe offline sending and receiving.
+
+### Offline Secret Exchange
+
+Offline messaging uses a dedicated shared secret separate from live session traffic.
+
+Current design:
+* secret is exchanged over an already encrypted live session
+* stored per locked peer
+* deterministic initiator rule avoids race
+* later bound by TOFU
+
+### TOFU
+
+Persistent mode uses TOFU for peer authenticity.
+
+Pinned item:
+* peer full I2P destination identity (base64 destination / fingerprint)
+
+Behavior:
+* first trusted save pins the peer identity
+* future live sessions must match the pinned identity
+* mismatch is blocked
+
+This binds:
+* live chat trust
+* offline secret
+* offline counters/state
+
+to the same persistent peer identity.
+
+### Deaddrop Server Retention
+
+Server retention is TTL-based:
+* blobs remain stored for a configured time
+* expired blobs are treated as missing
+* background GC removes expired files
+* no explicit delete/ack is required for basic operation
+
+Because keys rotate per message, old messages do not normally reappear unless client state is lost or rolled back.
+
+### Current Operational Model
+
+* live connected → normal real-time chat
+* persistent mode + locked peer + offline mode + no live chat → offline send/receive through deaddrop
+* startup in persistent mode → load identity, locked peer, offline state, start listener, start deaddrop runtime when appropriate
+
+## Security Summary
+
+### Strong points
+
+* all traffic over I2P
+* live content encrypted end-to-end
+* offline blobs contain no metadata
+* one key per message
+* rotating derived keys with receive window search
+* transient I2P access can be used for deaddrop operations
+* server sees only opaque keys/blobs
+* persistent/transient split reduces unnecessary residue
+* TOFU binds long-term peer identity
+
+### Residual limits
+
+* timing and traffic-pattern leakage still exist - (irrelevant on I2P) 
+* blob size may still reveal coarse information unless padded
+* local endpoint compromise defeats all protocol protections - (operational discipline)
+
+### Overall
+
+This architecture provides strong privacy, strong compartmentalization, and strong peer authenticity once TOFU is enforced, while keeping the offline layer minimal and metadata-poor.
