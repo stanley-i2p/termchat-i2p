@@ -1,13 +1,20 @@
 ## TermChatI2P
 
 TermChatI2P is a terminal-based private messenger designed for one-to-one communication over the I2P network.  
-It supports both **live encrypted chat** and **offline messaging**, while keeping the protocol compact and operationally simple.  
-The application has two modes: **transient mode** for short-lived live sessions, and **persistent mode** for long-term trusted peers with saved identity and offline support.  
-Live messages use an internal framed protocol and an additional end-to-end encryption layer on top of I2P transport.  
+It supports both **live encrypted chat** and **offline messaging**, while keeping the protocol compact and operationally simple.
+
+The application has two modes: **transient mode** for short-lived live sessions, and **persistent mode** for long-term trusted peers with saved identity and offline support.
+
+Live messages use an internal framed protocol and an additional end-to-end encryption layer on top of I2P transport.
+
 Persistent mode can lock a profile to a single peer, store offline messaging state, and exchange queued messages through minimal deaddrop servers.  
-Offline delivery uses opaque encrypted blobs and rotating per-message lookup keys, so the storage layer learns very little.  
+
+Offline delivery uses opaque encrypted blobs and rotating per-message lookup keys, so the storage layer learns very little.
+
 Peer trust in persistent mode is strengthened with **TOFU (Trust On First Use)** by pinning the peer’s full I2P destination identity for future verification.  
+
 The design emphasizes compartmentalization: live chat, offline delivery, persistent trust, and transient sessions are intentionally separated.  
+
 As a result, the messenger aims to provide strong privacy, low metadata exposure, and practical offline capability without relying on heavy server-side logic.
 
 ## Project Status
