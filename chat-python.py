@@ -1,6 +1,7 @@
 # Python 3.10+ compatibility
 # Use ./libi2p
 import sys, os
+import shutil
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 import i2plib
 
@@ -47,13 +48,25 @@ Image.MAX_IMAGE_PIXELS = 20_000_000
 
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".termchat-i2p")
 BASE_DIR = os.path.abspath(BASE_DIR)
-PROFILE_NAME = os.path.basename(sys.argv[1]) if len(sys.argv) > 1 else "default"
+
+RESET_PROFILE = False
+
+if len(sys.argv) > 2 and sys.argv[1] == "--reset":
+    RESET_PROFILE = True
+    PROFILE_NAME = os.path.basename(sys.argv[2])
+elif len(sys.argv) > 1:
+    PROFILE_NAME = os.path.basename(sys.argv[1])
+else:
+    PROFILE_NAME = "default"
 
 PROFILE_DIR = os.path.join(BASE_DIR, "profiles", PROFILE_NAME)
 
 IMAGE_DIR = os.path.join(BASE_DIR, "images")
 FILE_DIR = os.path.join(BASE_DIR, "files")
 BLOB_DIR = os.path.join(BASE_DIR, "blobs")
+
+if RESET_PROFILE and os.path.exists(PROFILE_DIR):
+    shutil.rmtree(PROFILE_DIR, ignore_errors=True)
 
 os.makedirs(PROFILE_DIR, exist_ok=True)
 os.makedirs(IMAGE_DIR, exist_ok=True)
@@ -96,7 +109,8 @@ class I2PChat(App):
         self.stored_peer_dest_b64 = None
         self.current_peer_addr = None
         self.current_peer_dest_b64 = None
-        self.profile = sys.argv[1] if len(sys.argv) > 1 else "default"
+        #self.profile = sys.argv[1] if len(sys.argv) > 1 else "default"
+        self.profile = PROFILE_NAME
     
         # Generate a unique ID for THIS appinstance
         self.session_id = f"chat_{self.profile}_{int(time.time())}"
@@ -130,7 +144,9 @@ class I2PChat(App):
         # Dеaddrop (Phase 1)
         self.deaddrop = DeadDropClient(
             self.dd_session_id,
-            ["62afc5yf2lcthx44okvavvmvgb55cee3weqeqhuapcclz6evwyrq.b32.i2p"]
+            ["62afc5yf2lcthx44okvavvmvgb55cee3weqeqhuapcclz6evwyrq.b32.i2p",
+             "x75crc4lkcd3xcfrj5sox662mujngzrtmvmejaixutdozg35fgvq.b32.i2p", "xxbgj3dlw7fvwz3emqnvyzxrdj3vqd3fcdw6rutmvzoxidyhp7bq.b32.i2p"
+            ]
         )
         
 
@@ -209,8 +225,12 @@ class I2PChat(App):
         
         #left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]"
 
+        #offline_tag = " [black on yellow] OFF [/]" if self.offline_mode else ""
+        #left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{offline_tag}"
+        
+        lock_tag = " [black on green] LOCK [/]" if self.stored_peer else " [black on red] UNLOCK [/]"
         offline_tag = " [black on yellow] OFF [/]" if self.offline_mode else ""
-        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{offline_tag}"
+        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{lock_tag}{offline_tag}"
         
         transfer = self.get_file_transfer_status()
 
@@ -622,6 +642,34 @@ class I2PChat(App):
 
 
     
+    def clear_offline_state_file(self):
+        try:
+            path = self.offline_state_path()
+            if os.path.exists(path):
+                os.remove(path)
+        except:
+            pass
+
+
+    def reset_peer_binding_state(self):
+        self.clear_offline_state_file()
+
+        self.stored_peer = None
+        self.stored_peer_dest_b64 = None
+        self.current_peer_addr = None
+        self.current_peer_dest_b64 = None
+
+        self.offline_shared_secret = b"CHANGE_ME_SHARED_OFFLINE_SECRET"
+        self.drop_send_index = 0
+        self.drop_recv_base = 0
+        self.drop_window = 8
+        self.consumed_drop_recv = set()
+
+        self.offline_mode = False
+        self.seen_drop_msgs = set()
+
+
+    
     def has_real_offline_secret(self) -> bool:
         return self.offline_shared_secret != b"CHANGE_ME_SHARED_OFFLINE_SECRET"
 
@@ -702,9 +750,13 @@ class I2PChat(App):
         self.post("system", "Initializing SAM Session...")
         self.post("system", f"Initializing Profile: {self.profile}")
         
+        if RESET_PROFILE:
+            self.post("system", f"Profile {self.profile} was reset before startup.")
         
         
-        is_persistent = len(sys.argv) > 1
+        
+        #is_persistent = len(sys.argv) > 1
+        is_persistent = self.profile != "default"
         
         
         self.chat_log.write(f"[#878700]SYSTEM:[/] [dim #5f5f5f italic]Mode:[/][not bold {'yellow' if is_persistent else 'green'}] {'PERSISTENT' if is_persistent else 'TRANSIENT'}[/]")
@@ -729,7 +781,7 @@ class I2PChat(App):
                 
                 if len(lines) > 1:
                     self.stored_peer = lines[1]
-                    self.post("system", f"Stored Contact: {self.stored_peer}")
+                    self.post("system", f"Locked Peer: {self.stored_peer}")
                     
                     
                 if len(lines) > 2:
@@ -854,10 +906,12 @@ class I2PChat(App):
             else:
                 self.post("error", "No stored contact. Use /connect <address>")
                 
-                
-        elif msg.strip() == "/save":
-            if len(sys.argv) <= 1:
-                self.post("error", "Cannot save in [bold green]TRANSIENT[/] mode. Restart with a profile name.")
+        
+        
+        
+        elif msg.strip() == "/lock":
+            if not self.is_persistent_mode():
+                self.post("error", "Cannot lock in [bold green]TRANSIENT[/] mode. Restart with a profile name.")
                 return
             
             if not self.conn:
@@ -896,7 +950,7 @@ class I2PChat(App):
                     await self.ensure_offline_runtime_started()
 
                     fp = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
-                    self.post("success", f"Identity [bold yellow]{self.profile}[/] is now locked to this peer.")
+                    self.post("success", f"Profile [bold yellow]{self.profile}[/] is now locked to this peer.")
                     self.post("system", f"TOFU peer pin saved: [cyan]{fp}[/]")
                 except Exception as e:
                     self.post("error", f"Failed to save: {e}")
@@ -995,7 +1049,8 @@ class I2PChat(App):
                     self.save_offline_state()
 
                     self.post("me_offline", msg)
-                    self.post("system", f"[OFFLINE] queued via deaddrop key_index={send_index}")
+                    #self.post("system", f"[OFFLINE] queued via deaddrop key_index={send_index}")
+                    self.post("system", f"[OFFLINE] queued and replicated via deaddrops key_index={send_index}")
 
                 elif status == "EXISTS":
                     self.post("error", f"[OFFLINE] key collision at index={send_index}, message not queued")
@@ -1768,6 +1823,9 @@ class I2PChat(App):
 
     def show_help(self):
 
+        self.post("help", "Command line options:")
+        self.post("help", "  Start with --reset <profile> to recreate a persistent profile from scratch")
+        
         self.post("help", "Available commands:")
 
         self.post("help", "Connection:")
@@ -1779,7 +1837,7 @@ class I2PChat(App):
         self.post("help", "  /offline                 Enter offline messaging mode (persistent locked peer only)")
         
         self.post("help", "Identity:")
-        self.post("help", "  /save                    Save identity (not available in TRANSIENT mode)")
+        self.post("help", "  /lock                    Lock persistent profile to current peer (not available in TRANSIENT mode)")
 
         self.post("help", "Files:")
         self.post("help", "  /sendfile <path>         Send file")
@@ -1791,6 +1849,8 @@ class I2PChat(App):
         self.post("help", "Utility:")
         self.post("help", "  /help                    Show this help")
         self.post("help", "  /CTRL+q                  Exit program")
+        
+        
 
 
 

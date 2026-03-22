@@ -80,6 +80,10 @@ class DeadDropClient:
     async def put(self, key: str, blob: bytes):
         print("[DD] PUT CALLED")
 
+        ok_count = 0
+        exists_count = 0
+        fail_count = 0
+
         for drop in self.drops:
             try:
                 print("[DD] CONNECTING TO:", drop)
@@ -95,22 +99,30 @@ class DeadDropClient:
                 resp = await reader.readline()
                 resp_str = resp.decode().strip()
                 print("[DD PUT RESP]", resp_str)
-                
+
                 writer.close()
                 await writer.wait_closed()
 
                 if resp_str == "OK":
-                    return "OK"
+                    ok_count += 1
                 elif resp_str == "EXISTS":
-                    print(f"[DD PUT] key already exists: {key}")
-                    return "EXISTS"
+                    print(f"[DD PUT] key already exists on {drop}: {key}")
+                    exists_count += 1
                 else:
-                    print(f"[DD PUT] unexpected response for key {key}: {resp_str}")
-                    return "FAIL"
-
+                    print(f"[DD PUT] unexpected response from {drop} for key {key}: {resp_str}")
+                    fail_count += 1
 
             except Exception as e:
                 print(f"[DROP PUT FAIL] {drop}: {e}")
+                fail_count += 1
+
+        if ok_count > 0:
+            return "OK"
+
+        if exists_count > 0 and ok_count == 0:
+            return "EXISTS"
+
+        return "FAIL"
 
     
     async def get(self, key: str):
