@@ -207,8 +207,10 @@ class I2PChat(App):
             tag_bg = "grey62" 
 
         
-        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]"
+        #left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]"
 
+        offline_tag = " [black on yellow] OFF [/]" if self.offline_mode else ""
+        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{offline_tag}"
         
         transfer = self.get_file_transfer_status()
 
@@ -591,7 +593,7 @@ class I2PChat(App):
             else:
                 self.consumed_drop_recv = set()
 
-            self.post("system", f"Loaded offline state for [cyan]{self.stored_peer}[/]")
+            self.post("system", f"Loaded offline state for {self.stored_peer}")
 
         except Exception as e:
             self.post("error", f"Failed to load offline state: {e}")
@@ -722,18 +724,18 @@ class I2PChat(App):
                 if len(lines) > 0:
                     raw_private_key = lines[0]
                     dest = i2plib.Destination(raw_private_key, has_private_key=True)
-                    self.post("system", f"Loaded identity from [cyan]{key_file}[/]")
+                    self.post("system", f"Loaded identity from {key_file}")
                 
                 
                 if len(lines) > 1:
                     self.stored_peer = lines[1]
-                    self.post("system", f"Stored Contact: [cyan]{self.stored_peer}.b32.i2p[/]")
+                    self.post("system", f"Stored Contact: {self.stored_peer}")
                     
                     
                 if len(lines) > 2:
                     self.stored_peer_dest_b64 = lines[2]
                     fp = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
-                    self.post("system", f"TOFU peer pin loaded: [cyan]{fp}[/]")
+                    self.post("system", f"TOFU peer pin loaded: {fp}")
                     
                     
                     
@@ -779,7 +781,7 @@ class I2PChat(App):
                 
                 self.load_offline_state()
                 
-                self.post("system", "Type [bold yellow]/connect[/] to dial stored contact.")
+                self.post("system", "Type /connect to dial stored contact.")
                 self.post("system", "Waiting for incoming connections...")
             else:
                 self.post("system", "Waiting for incoming connections...")
@@ -825,6 +827,7 @@ class I2PChat(App):
                 return
 
             self.offline_mode = True
+            self.watch_peer_b32(self.peer_b32)
             self.post("system", "Entered OFFLINE mode.")
             return
 
@@ -836,6 +839,7 @@ class I2PChat(App):
             
             if self.offline_mode:
                 self.leave_offline_mode()
+                self.watch_peer_b32(self.peer_b32)
                 self.post("system", "Leaving OFFLINE mode.")
             
             parts = msg.split(" ")
@@ -1104,6 +1108,7 @@ class I2PChat(App):
 
                 if self.offline_mode:
                     self.leave_offline_mode()
+                    self.watch_peer_b32(self.peer_b32)
                     self.post("system", "Leaving OFFLINE mode due to live incoming connection.")
 
                 self.conn = (reader, writer)
@@ -1534,7 +1539,8 @@ class I2PChat(App):
             
             self.conn = None
             self.current_peer_dest_b64 = None
-            self.peer_b32 = "Waiting for incoming connections..." 
+            self.peer_b32 = "Waiting for incoming connections..."
+            self.watch_peer_b32(self.peer_b32)
             try:
                 
                 writer.write(self.frame_message('S', "__SIGNAL__:QUIT"))
