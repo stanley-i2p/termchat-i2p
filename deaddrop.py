@@ -95,16 +95,19 @@ class DeadDropClient:
                 resp = await reader.readline()
                 resp_str = resp.decode().strip()
                 print("[DD PUT RESP]", resp_str)
-
-                if resp_str == "OK":
-                    pass
-                elif resp_str == "EXISTS":
-                    print(f"[DD PUT] key already exists: {key}")
-                else:
-                    print(f"[DD PUT] unexpected response for key {key}: {resp_str}")
-
+                
                 writer.close()
                 await writer.wait_closed()
+
+                if resp_str == "OK":
+                    return "OK"
+                elif resp_str == "EXISTS":
+                    print(f"[DD PUT] key already exists: {key}")
+                    return "EXISTS"
+                else:
+                    print(f"[DD PUT] unexpected response for key {key}: {resp_str}")
+                    return "FAIL"
+
 
             except Exception as e:
                 print(f"[DROP PUT FAIL] {drop}: {e}")

@@ -980,16 +980,28 @@ class I2PChat(App):
                 
         elif self.offline_ready() and self.offline_mode:
             try:
+                send_index = self.drop_send_index
+                dd_key = self.derive_deaddrop_key("send", send_index)
+
                 frame = self.frame_message('U', msg.encode())
-                dd_key = self.next_deaddrop_send_key()
                 blob_key = self.get_offline_blob_key()
                 blob = self.e2e.encrypt_offline_blob(frame, blob_key)
 
-                await self.deaddrop.put(dd_key, blob)
-                self.save_offline_state()
+                status = await self.deaddrop.put(dd_key, blob)
+                self.post("system", f"[DEBUG PUT STATUS] {status}")
 
-                self.post("me_offline", msg)
-                self.post("system", f"[OFFLINE] queued via deaddrop key_index={self.drop_send_index - 1}")
+                if status == "OK":
+                    self.drop_send_index += 1
+                    self.save_offline_state()
+
+                    self.post("me_offline", msg)
+                    self.post("system", f"[OFFLINE] queued via deaddrop key_index={send_index}")
+
+                elif status == "EXISTS":
+                    self.post("error", f"[OFFLINE] key collision at index={send_index}, message not queued")
+
+                else:
+                    self.post("error", "[OFFLINE send failed] deaddrop PUT did not succeed")
 
             except Exception as e:
                 self.post("error", f"[OFFLINE send failed] {e}")
