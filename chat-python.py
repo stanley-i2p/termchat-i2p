@@ -1103,31 +1103,40 @@ class I2PChat(App):
                 
         elif self.offline_ready() and self.offline_mode:
             try:
-                send_index = self.drop_send_index
-                dd_key = self.derive_deaddrop_key("send", send_index)
-
-                frame = self.frame_message('U', msg.encode())
                 blob_key = self.get_offline_blob_key()
+                frame = self.frame_message('U', msg.encode())
                 blob = self.e2e.encrypt_offline_blob(frame, blob_key)
 
-                status = await self.deaddrop.put(dd_key, blob)
-                #self.post("system", f"[DEBUG PUT STATUS] {status}")
+                max_attempts = 8
+                queued = False
 
-                if status == "OK":
-                    self.drop_send_index += 1
-                    self.save_offline_state()
-                    self.set_dd_status("put_ok")
+                for _ in range(max_attempts):
+                    send_index = self.drop_send_index
+                    dd_key = self.derive_deaddrop_key("send", send_index)
 
-                    self.post("me_offline", msg)
-                    self.post("system", f"[OFFLINE] queued and replicated via deaddrops key_index={send_index}")
+                    status = await self.deaddrop.put(dd_key, blob)
 
-                elif status == "EXISTS":
+                    if status == "OK":
+                        self.drop_send_index += 1
+                        self.save_offline_state()
+                        self.set_dd_status("put_ok")
+                        self.post("me_offline", msg)
+                        self.post("system", f"[OFFLINE] queued and replicated via deaddrops key_index={send_index}")
+                        queued = True
+                        break
+
+                    elif status == "EXISTS":
+                        self.drop_send_index += 1
+                        continue
+
+                    else:
+                        self.set_dd_status("put_fail")
+                        self.post("error", "[OFFLINE send failed] deaddrop PUT did not succeed")
+                        break
+
+                if not queued and status == "EXISTS":
                     self.set_dd_status("put_fail")
-                    self.post("error", f"[OFFLINE] key collision at index={send_index}, message not queued")
-
-                else:
-                    self.set_dd_status("put_fail")
-                    self.post("error", "[OFFLINE send failed] deaddrop PUT did not succeed")
+                    self.post("error", f"[OFFLINE] key collision after {max_attempts} attempts")
 
             except Exception as e:
                 self.set_dd_status("put_fail")
