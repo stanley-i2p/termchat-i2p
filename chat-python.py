@@ -109,7 +109,10 @@ class I2PChat(App):
         self.stored_peer_dest_b64 = None
         self.current_peer_addr = None
         self.current_peer_dest_b64 = None
-        #self.profile = sys.argv[1] if len(sys.argv) > 1 else "default"
+        
+        self.tofu_verified = False
+        self.tofu_mismatch = False
+        
         self.profile = PROFILE_NAME
     
         # Generate a unique ID for THIS appinstance
@@ -223,14 +226,19 @@ class I2PChat(App):
             tag_bg = "grey62" 
 
         
-        #left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]"
-
-        #offline_tag = " [black on yellow] OFF [/]" if self.offline_mode else ""
-        #left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{offline_tag}"
+        
         
         lock_tag = " [black on green] LOCK [/]" if self.stored_peer else " [black on red] UNLOCK [/]"
+        
+        if self.tofu_mismatch:
+            tofu_tag = " [black on red] TOFU [/]"
+        elif self.tofu_verified:
+            tofu_tag = " [black on green] TOFU [/]"
+        else:
+            tofu_tag = ""
+        
         offline_tag = " [black on yellow] OFF [/]" if self.offline_mode else ""
-        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{lock_tag}{offline_tag}"
+        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{lock_tag}{tofu_tag}{offline_tag}"
         
         transfer = self.get_file_transfer_status()
 
@@ -461,6 +469,26 @@ class I2PChat(App):
         if not self.stored_peer_dest_b64:
             return True
         return dest_b64 == self.stored_peer_dest_b64
+
+
+    def set_tofu_verified(self):
+        self.tofu_verified = True
+        self.tofu_mismatch = False
+        self.watch_peer_b32(self.peer_b32)
+
+
+    def set_tofu_mismatch(self):
+        self.tofu_verified = False
+        self.tofu_mismatch = True
+        self.watch_peer_b32(self.peer_b32)
+
+
+    def clear_tofu_runtime_status(self):
+        self.tofu_verified = False
+        self.tofu_mismatch = False
+        self.watch_peer_b32(self.peer_b32)
+
+
 
 
     def get_offline_peer_b32(self):
@@ -938,6 +966,7 @@ class I2PChat(App):
 
                     self.stored_peer = self.current_peer_addr
                     self.stored_peer_dest_b64 = self.current_peer_dest_b64
+                    self.tofu_mismatch = False
 
                     # Initialize and persist offline state for this locked peer
                     self.drop_send_index = 0
@@ -1042,7 +1071,7 @@ class I2PChat(App):
                 blob = self.e2e.encrypt_offline_blob(frame, blob_key)
 
                 status = await self.deaddrop.put(dd_key, blob)
-                self.post("system", f"[DEBUG PUT STATUS] {status}")
+                #self.post("system", f"[DEBUG PUT STATUS] {status}")
 
                 if status == "OK":
                     self.drop_send_index += 1
@@ -1152,13 +1181,21 @@ class I2PChat(App):
                     if self.stored_peer_dest_b64 and raw_dest != self.stored_peer_dest_b64:
                         fp_old = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
                         fp_new = self.peer_dest_fingerprint(raw_dest)
+                        self.set_tofu_mismatch()
                         self.post("error", f"TOFU mismatch for {peer_addr}: expected {fp_old}, got {fp_new}")
                         writer.close()
                         continue
                  
                     
                     self.current_peer_addr = peer_addr
-                    self.peer_b32 = peer_addr 
+                    self.current_peer_dest_b64 = raw_dest
+                    self.peer_b32 = peer_addr
+
+                    if self.stored_peer_dest_b64:
+                        self.set_tofu_verified()
+                    else:
+                        self.clear_tofu_runtime_status()
+
                     self.post("success", f"Connection accepted from {peer_addr[:12]}...")
                 except:
                     peer_addr = "Unknown"
@@ -1230,6 +1267,7 @@ class I2PChat(App):
                 self.current_peer_dest_b64 = None
                 self.post("disconnect", "Peer disconnected.")
                 self.peer_b32 = "Waiting for incoming connections..."
+                self.clear_tofu_runtime_status()
                 self.post("system", "Waiting for incoming connections...")
 
             try:
@@ -1376,6 +1414,7 @@ class I2PChat(App):
                     if self.stored_peer_dest_b64 and body != self.stored_peer_dest_b64:
                         fp_old = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
                         fp_new = self.peer_dest_fingerprint(body)
+                        self.set_tofu_mismatch()
                         self.post("error", f"TOFU mismatch for {peer_addr}: expected {fp_old}, got {fp_new}")
                         if self.conn and writer is not None:
                             try:
@@ -1388,6 +1427,11 @@ class I2PChat(App):
                     self.current_peer_addr = peer_addr
                     self.current_peer_dest_b64 = body
                     self.peer_b32 = peer_addr
+                    
+                    if self.stored_peer_dest_b64:
+                        self.set_tofu_verified()
+                    else:
+                        self.clear_tofu_runtime_status()
 
                     fp = self.peer_dest_fingerprint(body)
                     self.post("info", f"Peer Identity: {peer_addr} [dim](TOFU {fp})[/]")
@@ -1607,7 +1651,8 @@ class I2PChat(App):
             self.conn = None
             self.current_peer_dest_b64 = None
             self.peer_b32 = "Waiting for incoming connections..."
-            self.watch_peer_b32(self.peer_b32)
+            self.clear_tofu_runtime_status()
+            
             try:
                 
                 writer.write(self.frame_message('S', "__SIGNAL__:QUIT"))

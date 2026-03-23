@@ -10,6 +10,9 @@ class DeadDropClient:
 
         self.ctrl_reader = None
         self.ctrl_writer = None
+        
+        self.connect_timeout = 8.0
+        self.io_timeout = 8.0
 
     
     # Init Session
@@ -47,15 +50,16 @@ class DeadDropClient:
     # Stream connect
     
     async def _connect(self, destination):
-        reader, writer = await asyncio.open_connection(
-            self.sam_host, self.sam_port
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(self.sam_host, self.sam_port),
+            timeout=self.connect_timeout
         )
 
         
         writer.write(b"HELLO VERSION MIN=3.0 MAX=3.2\n")
         await writer.drain()
-        await reader.readline()
-
+        await asyncio.wait_for(reader.readline(), timeout=self.io_timeout)
+        
         # connect
         cmd = f"STREAM CONNECT ID={self.session_id} DESTINATION={destination}\n"
 
@@ -64,7 +68,7 @@ class DeadDropClient:
         writer.write(cmd.encode())
         await writer.drain()
 
-        resp = await reader.readline()
+        resp = await asyncio.wait_for(reader.readline(), timeout=self.io_timeout)
         resp_str = resp.decode().strip()
 
         print("[DD CONNECT RESP]", resp_str)
@@ -76,82 +80,103 @@ class DeadDropClient:
 
         return reader, writer
 
+
+
+    async def _put_one(self, drop: str, key: str, blob: bytes):
+        try:
+            print("[DD] CONNECTING TO:", drop)
+            print("[DD] SESSION:", self.session_id)
+            print("[DD] KEY:", key)
+
+            reader, writer = await self._connect(drop)
+
+            writer.write(f"PUT {key} {len(blob)}\n".encode())
+            writer.write(blob)
+            await asyncio.wait_for(writer.drain(), timeout=self.io_timeout)
+
+            resp = await asyncio.wait_for(reader.readline(), timeout=self.io_timeout)
+            resp_str = resp.decode().strip()
+            print("[DD PUT RESP]", resp_str)
+
+            writer.close()
+            await writer.wait_closed()
+
+            if resp_str == "OK":
+                return "OK"
+            elif resp_str == "EXISTS":
+                print(f"[DD PUT] key already exists on {drop}: {key}")
+                return "EXISTS"
+            else:
+                print(f"[DD PUT] unexpected response from {drop} for key {key}: {resp_str}")
+                return "FAIL"
+
+        except Exception as e:
+            print(f"[DROP PUT FAIL] {drop}: {e}")
+            return "FAIL"
+
+
     
     async def put(self, key: str, blob: bytes):
         print("[DD] PUT CALLED")
 
-        ok_count = 0
-        exists_count = 0
-        fail_count = 0
+        tasks = [
+            asyncio.create_task(self._put_one(drop, key, blob))
+            for drop in self.drops
+        ]
 
-        for drop in self.drops:
-            try:
-                print("[DD] CONNECTING TO:", drop)
-                print("[DD] SESSION:", self.session_id)
-                print("[DD] KEY:", key)
+        results = await asyncio.gather(*tasks, return_exceptions=False)
 
-                reader, writer = await self._connect(drop)
-
-                writer.write(f"PUT {key} {len(blob)}\n".encode())
-                writer.write(blob)
-                await writer.drain()
-
-                resp = await reader.readline()
-                resp_str = resp.decode().strip()
-                print("[DD PUT RESP]", resp_str)
-
-                writer.close()
-                await writer.wait_closed()
-
-                if resp_str == "OK":
-                    ok_count += 1
-                elif resp_str == "EXISTS":
-                    print(f"[DD PUT] key already exists on {drop}: {key}")
-                    exists_count += 1
-                else:
-                    print(f"[DD PUT] unexpected response from {drop} for key {key}: {resp_str}")
-                    fail_count += 1
-
-            except Exception as e:
-                print(f"[DROP PUT FAIL] {drop}: {e}")
-                fail_count += 1
+        ok_count = sum(1 for r in results if r == "OK")
+        exists_count = sum(1 for r in results if r == "EXISTS")
 
         if ok_count > 0:
             return "OK"
 
-        if exists_count > 0 and ok_count == 0:
+        if exists_count > 0:
             return "EXISTS"
 
         return "FAIL"
 
-    
+ 
+ 
+    async def _get_one(self, drop: str, key: str):
+        try:
+            print("[DD GET] CONNECTING TO:", drop)
+
+            reader, writer = await self._connect(drop)
+
+            writer.write(f"GET {key}\n".encode())
+            await asyncio.wait_for(writer.drain(), timeout=self.io_timeout)
+
+            header = await asyncio.wait_for(reader.readline(), timeout=self.io_timeout)
+            print("[DD GET HEADER]", header.decode().strip())
+
+            data = None
+
+            if header.startswith(b"OK"):
+                size = int(header.split()[1])
+                data = await asyncio.wait_for(reader.readexactly(size), timeout=self.io_timeout)
+
+            writer.close()
+            await writer.wait_closed()
+
+            return data
+
+        except Exception as e:
+            print(f"[DROP GET FAIL] {drop}: {e}")
+            return None
+ 
+ 
+ 
     async def get(self, key: str):
-        results = []
+        tasks = [
+            asyncio.create_task(self._get_one(drop, key))
+            for drop in self.drops
+        ]
 
-        for drop in self.drops:
-            try:
-                print("[DD GET] CONNECTING TO:", drop)
+        results = await asyncio.gather(*tasks, return_exceptions=False)
 
-                reader, writer = await self._connect(drop)
-
-                writer.write(f"GET {key}\n".encode())
-                await writer.drain()
-
-                header = await reader.readline()
-                print("[DD GET HEADER]", header.decode().strip())
-
-                if header.startswith(b"OK"):
-                    size = int(header.split()[1])
-                    data = await reader.readexactly(size)
-                    results.append(data)
-
-                writer.close()
-                await writer.wait_closed()
-
-            except Exception as e:
-                print(f"[DROP GET FAIL] {drop}: {e}")
-
-        return results
+        return [data for data in results if data is not None]
 
     
     async def close(self):
