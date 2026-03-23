@@ -35,6 +35,8 @@ As a result, the messenger aims to provide strong privacy, low metadata exposure
 
 TermchatI2P — это консольный (TUI) мессенджер, работающий через анонимную сеть **I2P (Invisible Internet Project)**. Проект ориентирован на максимальную приватность, исключая центральные сервера и метаданные.
 
+![TermchatI2P](chat3.png)
+![TermchatI2P](chat4.png)
 ![TermchatI2P](chat.png)
 ![TermchatI2P](chat2.png)
 
