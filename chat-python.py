@@ -159,6 +159,9 @@ class I2PChat(App):
         self.deaddrop_poller_started = False
         self.offline_mode = False
         
+        self.dd_status = "idle"
+        self.dd_status_ts = 0.0
+        
         self.seen_drop_msgs = set()
         
         # OFFLINE key window state
@@ -238,9 +241,14 @@ class I2PChat(App):
             tofu_tag = ""
         
         offline_tag = " [black on yellow] OFF [/]" if self.offline_mode else ""
-        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{lock_tag}{tofu_tag}{offline_tag}"
+        
+        dd_label = self.get_dd_status_label()
+        dd_tag = f" {dd_label}" if self.offline_mode and dd_label else ""
+        
+        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{lock_tag}{tofu_tag}{offline_tag}{dd_tag}"
         
         transfer = self.get_file_transfer_status()
+        #dd_label = self.get_dd_status_label()
 
         if transfer:
             conn_viz = transfer
@@ -249,6 +257,7 @@ class I2PChat(App):
             link_color = "green" if is_proven else "cyan"
             link_symbol = "●" if is_proven else "o"
             conn_viz = f"[bold {link_color}]{link_symbol}[/] [dim]CONNECTED[/]"
+                    
         else:
             
             conn_viz = f"[dim]{dot} [dim]STANDBY[/]"
@@ -490,6 +499,34 @@ class I2PChat(App):
 
 
 
+    def set_dd_status(self, status: str):
+        self.dd_status = status
+        self.dd_status_ts = time.time()
+        self.watch_peer_b32(self.peer_b32)
+
+
+    def get_dd_status_label(self) -> str:
+        if not self.offline_mode:
+            return ""
+
+        age = time.time() - self.dd_status_ts if self.dd_status_ts else 9999
+
+        if age > 8:
+            return "[black on grey62] DD IDLE [/]"
+
+        mapping = {
+            "idle": "[black on grey62] DD IDLE [/]",
+            "poll": "[black on yellow] DD POLL [/]",
+            "put_ok": "[black on green] DD PUT [/]",
+            "put_fail": "[black on red] DD FAIL [/]",
+            "get_hit": "[black on magenta] DD HIT [/]",
+            "get_miss": "[black on grey62] DD MISS [/]",
+            "get_fail": "[black on red] DD FAIL [/]",
+        }
+
+        return mapping.get(self.dd_status, "[black on grey62] DD IDLE [/]")
+
+
 
     def get_offline_peer_b32(self):
         peer = self.stored_peer or self.current_peer_addr
@@ -587,6 +624,9 @@ class I2PChat(App):
     
     def leave_offline_mode(self):
         self.offline_mode = False
+        self.dd_status = "idle"
+        self.dd_status_ts = 0.0
+        self.watch_peer_b32(self.peer_b32)
     
     
     def offline_state_path(self) -> str:
@@ -1076,18 +1116,21 @@ class I2PChat(App):
                 if status == "OK":
                     self.drop_send_index += 1
                     self.save_offline_state()
+                    self.set_dd_status("put_ok")
 
                     self.post("me_offline", msg)
-                    #self.post("system", f"[OFFLINE] queued via deaddrop key_index={send_index}")
                     self.post("system", f"[OFFLINE] queued and replicated via deaddrops key_index={send_index}")
 
                 elif status == "EXISTS":
+                    self.set_dd_status("put_fail")
                     self.post("error", f"[OFFLINE] key collision at index={send_index}, message not queued")
 
                 else:
+                    self.set_dd_status("put_fail")
                     self.post("error", "[OFFLINE send failed] deaddrop PUT did not succeed")
 
             except Exception as e:
+                self.set_dd_status("put_fail")
                 self.post("error", f"[OFFLINE send failed] {e}")
                 
                 
@@ -1801,13 +1844,17 @@ class I2PChat(App):
 
                 recv_window = self.get_deaddrop_recv_window()
                 blob_key = self.get_offline_blob_key()
+                self.set_dd_status("poll")
 
                 for recv_index, dd_key in recv_window:
                     try:
                         blobs = await self.deaddrop.get(dd_key)
 
                         if not blobs:
+                            self.set_dd_status("get_miss")
                             continue
+                        
+                        self.set_dd_status("get_hit")
 
                         got_valid_blob = False
 
@@ -1843,9 +1890,11 @@ class I2PChat(App):
                             self.save_offline_state()
 
                     except Exception as e:
+                        self.set_dd_status("get_fail")
                         self.post("error", f"[DROP key poll error] {e}")
 
             except Exception as e:
+                self.set_dd_status("get_fail")
                 self.post("error", f"[DROP polling error] {e}")
 
             await asyncio.sleep(5)
