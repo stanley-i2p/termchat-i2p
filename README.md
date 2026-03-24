@@ -194,7 +194,7 @@ NOTE: Updated version of **i2plib** is provided. DO NOT use legacy **libi2p** ve
 NOTE: Next Phase of development will remove i2plib dependencies completely.
 
 
-### Running the Messenger
+## Running the Messenger
 
 Start the application with:
 ```bash
