@@ -132,51 +132,113 @@ TermchatI2P — это консольный (TUI) мессенджер, рабо
 ![TermchatI2P](chat4.png)
 ![TermchatI2P](chat2.png)
 
-## 🚀 Быстрый старт
+## Quick start
 
-### Предварительные требования
-1.  **I2P Роутер:** На вашем компьютере должен быть запущен I2P роутер (Java I2P или i2pd).
-2.  **SAM интерфейс:** Убедитесь, что в настройках роутера включен протокол SAM (обычно порт `7656`).
-3.  **Python version > 3.9, 3.14 preferred** и установленные зависимости:
-    ```bash
-    pip install i2plib textual rich
-    ```
+## Requirements
 
-### 🐍 Настройка окружения (Python 3.14 + venv)
+Before running the messenger, make sure the following components are available:
 
-Для изоляции зависимостей и корректной работы мессенджера рекомендуется использовать виртуальное окружение.
+### I2P Router
+An I2P router must already be running on your machine.  
+Supported options include:
 
-#### Установка Python 3.14 (если не установлен)
-1. Установка uv
+- Java I2P
+- i2pd
+
+### SAM Interface
+The router must have the **SAM interface enabled**, since the messenger uses it to create I2P sessions.  
+The default SAM endpoint is usually:
+
+```bash
+127.0.0.1:7656
+```
+
+### Python
+
+Use Python 3.10 or newer.
+A modern Python release is recommended.
+
+### Python Environment Setup
+
+It is strongly recommended to use a virtual environment so the messenger dependencies stay isolated from the rest of your system.
+
+**Option 1:** Using uv (recommended)
+  
+* Install uv:
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
-2. Создание окружения с ПРАВИЛЬНОЙ версией одной командой
+* Create a virtual environment with a recent Python version:
 ```bash
 uv venv --python 3.14 i2p_env
 ```
-3. Активация
-
+* Activate it:
 ```bash
 source i2p_env/bin/activate
 ```
 
+**Option 2:** Using standard venv
 
-
-### Запуск
-Для запуска мессенджера используйте команду:
 ```bash
-python chat.py [имя_профиля]
+python3 -m venv i2p_env
+source i2p_env/bin/activate
 ```
 
-Если имя_профиля не указано, приложение запустится в Transient (временном) режиме — ваш адрес будет меняться при каждом перезапуске.
-Если указать имя (например, python chat.py alice), создастся файл alice.dat, который сохранит ваш постоянный адрес I2P.
+### Installing Dependencies
 
-🛠 Управление в приложении
+Install everything in one step with:
+```bash
+pip install -r requirements.txt
+```
+NOTE: Updated version of **i2plib** is provided. DO NOT use legacy **libi2p** versions.
+NOTE: Next Phase of development will remove i2plib dependencies completely.
 
-    Связь с контактом: Введите /connect <адрес.b32.i2p> в поле ввода.
-    Быстрое подключение: Если в файле профиля (вторая строка .dat файла) сохранен адрес друга, введите /connect без аргументов.
-    Выход: Нажмите Ctrl+Q или просто q.
+
+### Running the Messenger
+
+Start the application with:
+```bash
+python chat.py [profile_name]
+```
+Examples:
+```bash
+python chat.py
+python chat.py alice
+```
+
+#### Transient Mode
+
+If no profile name is provided, the messenger starts in **Transient mode**.
+
+In this mode:
+
+    - the local I2P identity is temporary
+    - the address changes on restart
+    - the mode is intended for short-lived live sessions
+    
+### Persistent Mode
+
+If a profile name is provided, the messenger starts in **Persistent mode**.
+
+Example:
+```basg
+python chat.py alice
+```
+In this mode:
+
+    - a profile directory is created for that identity
+    - the local I2P identity is kept across restarts
+    - the profile can later be locked to a trusted peer
+    - offline messaging features are available only in this mode
+    
+### Profile Reset
+
+To completely recreate a persistent profile from scratch, use:
+```bash
+python chat.py --reset alice
+```
+This removes the **old profile** state for alice and starts again with a **fresh identity and clean local state**.
+
 
 ### 🔒 Анализ безопасности и сравнение
 
