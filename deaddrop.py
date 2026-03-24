@@ -102,19 +102,41 @@ class DeadDropClient:
             await writer.wait_closed()
 
             if resp_str == "OK":
-                return "OK"
+                return (drop, "OK")
             elif resp_str == "EXISTS":
                 print(f"[DD PUT] key already exists on {drop}: {key}")
-                return "EXISTS"
+                return (drop, "EXISTS")
             else:
                 print(f"[DD PUT] unexpected response from {drop} for key {key}: {resp_str}")
-                return "FAIL"
+                return (drop, "FAIL")
 
         except Exception as e:
             print(f"[DROP PUT FAIL] {drop}: {e}")
-            return "FAIL"
+            return (drop, "FAIL")
 
 
+    
+    # async def put(self, key: str, blob: bytes):
+    #     print("[DD] PUT CALLED")
+    # 
+    #     tasks = [
+    #         asyncio.create_task(self._put_one(drop, key, blob))
+    #         for drop in self.drops
+    #     ]
+    # 
+    #     results = await asyncio.gather(*tasks, return_exceptions=False)
+    # 
+    #     ok_count = sum(1 for r in results if r == "OK")
+    #     exists_count = sum(1 for r in results if r == "EXISTS")
+    # 
+    #     if ok_count > 0:
+    #         return "OK"
+    # 
+    #     if exists_count > 0:
+    #         return "EXISTS"
+    # 
+    #     return "FAIL"
+    
     
     async def put(self, key: str, blob: bytes):
         print("[DD] PUT CALLED")
@@ -126,16 +148,16 @@ class DeadDropClient:
 
         results = await asyncio.gather(*tasks, return_exceptions=False)
 
-        ok_count = sum(1 for r in results if r == "OK")
-        exists_count = sum(1 for r in results if r == "EXISTS")
+        ok_drops = [drop for drop, status in results if status == "OK"]
+        exists_drops = [drop for drop, status in results if status == "EXISTS"]
 
-        if ok_count > 0:
-            return "OK"
+        if ok_drops:
+            return ("OK", ok_drops)
 
-        if exists_count > 0:
-            return "EXISTS"
+        if exists_drops:
+            return ("EXISTS", exists_drops)
 
-        return "FAIL"
+        return ("FAIL", [])
 
  
  
@@ -160,14 +182,25 @@ class DeadDropClient:
             writer.close()
             await writer.wait_closed()
 
-            return data
+            return (drop, data)
 
         except Exception as e:
             print(f"[DROP GET FAIL] {drop}: {e}")
-            return None
+            return (drop, None)
  
  
  
+    # async def get(self, key: str):
+    #     tasks = [
+    #         asyncio.create_task(self._get_one(drop, key))
+    #         for drop in self.drops
+    #     ]
+    # 
+    #     results = await asyncio.gather(*tasks, return_exceptions=False)
+    # 
+    #     return [data for data in results if data is not None]
+    
+    
     async def get(self, key: str):
         tasks = [
             asyncio.create_task(self._get_one(drop, key))
@@ -176,7 +209,8 @@ class DeadDropClient:
 
         results = await asyncio.gather(*tasks, return_exceptions=False)
 
-        return [data for data in results if data is not None]
+        good = [(drop, data) for drop, data in results if data is not None]
+        return good
 
     
     async def close(self):

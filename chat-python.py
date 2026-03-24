@@ -145,13 +145,15 @@ class I2PChat(App):
         self.e2e = E2E()
         
         # Dеaddrop (Phase 1)
+        self.deaddrop_servers = ["62afc5yf2lcthx44okvavvmvgb55cee3weqeqhuapcclz6evwyrq.b32.i2p",
+             "x75crc4lkcd3xcfrj5sox662mujngzrtmvmejaixutdozg35fgvq.b32.i2p", "xxbgj3dlw7fvwz3emqnvyzxrdj3vqd3fcdw6rutmvzoxidyhp7bq.b32.i2p"
+        ]
+        
+        
         self.deaddrop = DeadDropClient(
             self.dd_session_id,
-            ["62afc5yf2lcthx44okvavvmvgb55cee3weqeqhuapcclz6evwyrq.b32.i2p",
-             "x75crc4lkcd3xcfrj5sox662mujngzrtmvmejaixutdozg35fgvq.b32.i2p", "xxbgj3dlw7fvwz3emqnvyzxrdj3vqd3fcdw6rutmvzoxidyhp7bq.b32.i2p"
-            ]
+            self.deaddrop_servers
         )
-        
 
         
         self.deaddrop_enabled = self.is_persistent_mode()
@@ -425,7 +427,7 @@ class I2PChat(App):
         if version != PROTOCOL_VERSION:
             raise ValueError("Unsupported protocol version")
         
-        if msg_type not in b"UDISFCEKPOX":
+        if msg_type not in b"UDISFCEKPOXL":
             raise ValueError("Unknown frame type")
 
     
@@ -451,7 +453,7 @@ class I2PChat(App):
         if version != PROTOCOL_VERSION:
             raise ValueError("Unsupported protocol version")
 
-        if msg_type not in b"UDISFCEKPOX":
+        if msg_type not in b"UDISFCEKPOXL":
             raise ValueError("Unknown frame type")
 
         if length < 0 or length > MAX_FRAME_SIZE:
@@ -719,6 +721,7 @@ class I2PChat(App):
             pass
 
 
+
     def reset_peer_binding_state(self):
         self.clear_offline_state_file()
 
@@ -805,6 +808,154 @@ class I2PChat(App):
 
 
 
+    def deaddrop_servers_path(self) -> str:
+        return os.path.join(PROFILE_DIR, "deaddrop_servers.txt")
+
+
+    def load_deaddrop_servers(self):
+        if not self.is_persistent_mode():
+            return
+
+        path = self.deaddrop_servers_path()
+        if not os.path.exists(path):
+            return
+
+        try:
+            with open(path, "r") as f:
+                servers = [line.strip() for line in f.readlines() if line.strip()]
+
+            # Deduplication and healthy order
+            merged = []
+            seen = set()
+            for s in servers:
+                s = s.strip().lower()
+                if not self.is_valid_deaddrop_server(s):
+                    continue
+                if s not in seen:
+                    seen.add(s)
+                    merged.append(s)
+
+            if merged:
+                self.deaddrop_servers = merged
+                self.deaddrop.drops = list(self.deaddrop_servers)
+                self.post("system", f"Loaded {len(self.deaddrop_servers)} deaddrop servers.")
+        except Exception as e:
+            self.post("error", f"Failed to load deaddrop servers: {e}")
+
+
+    def save_deaddrop_servers(self):
+        if not self.is_persistent_mode():
+            return
+
+        try:
+            path = self.deaddrop_servers_path()
+            with open(path, "w") as f:
+                for s in self.deaddrop_servers:
+                    f.write(s + "\n")
+        except Exception as e:
+            self.post("error", f"Failed to save deaddrop servers: {e}")
+
+
+    def merge_deaddrop_servers(self, new_servers):
+        changed = False
+
+        for s in new_servers:
+            s = s.strip().lower()
+            
+            if not self.is_valid_deaddrop_server(s):
+                continue
+            
+            if s not in self.deaddrop_servers:
+                self.deaddrop_servers.append(s)
+                changed = True
+
+        if changed:
+            self.deaddrop.drops = list(self.deaddrop_servers)
+            self.save_deaddrop_servers()
+
+        return changed
+
+
+    def prefer_deaddrop_server(self, server: str):
+        if server in self.deaddrop_servers:
+            self.deaddrop_servers.remove(server)
+            self.deaddrop_servers.insert(0, server)
+            self.deaddrop.drops = list(self.deaddrop_servers)
+            self.save_deaddrop_servers()
+
+
+
+    def is_valid_deaddrop_server(self, server: str) -> bool:
+        server = server.strip().lower()
+
+        if not server:
+            return False
+
+        if not server.endswith(".b32.i2p"):
+            return False
+
+        host = server[:-8]  # strip ".b32.i2p"
+
+        if len(host) < 20:
+            return False
+
+        allowed = set("abcdefghijklmnopqrstuvwxyz234567")
+        return all(ch in allowed for ch in host)
+
+
+
+    async def send_deaddrop_server_list(self):
+        if not self.conn:
+            return
+
+        try:
+            _, writer = self.conn
+            payload = "\n".join(self.deaddrop_servers).encode()
+            writer.write(self.frame_message('L', payload))
+            await writer.drain()
+            self.post("system", f"Shared {len(self.deaddrop_servers)} deaddrop servers with peer.")
+        except Exception as e:
+            self.post("error", f"Failed to share deaddrop servers: {e}")
+
+
+
+    def show_deaddrop_servers(self):
+        self.post("system", f"Known deaddrop servers: {len(self.deaddrop_servers)}")
+        for i, s in enumerate(self.deaddrop_servers, start=1):
+            self.post("system", f"  {i}. {s}")
+
+
+    def add_deaddrop_server(self, server: str):
+        server = server.strip().lower()
+
+        if not self.is_valid_deaddrop_server(server):
+            self.post("error", "Invalid deaddrop server address.")
+            return
+
+        if server in self.deaddrop_servers:
+            self.post("error", "Deaddrop server already exists.")
+            return
+
+        self.deaddrop_servers.append(server)
+        self.deaddrop.drops = list(self.deaddrop_servers)
+        self.save_deaddrop_servers()
+        self.post("success", f"Added deaddrop server: {server}")
+
+
+    def delete_deaddrop_server_by_index(self, index: int):
+        if index < 1 or index > len(self.deaddrop_servers):
+            self.post("error", "Invalid deaddrop server number.")
+            return
+
+        removed = self.deaddrop_servers.pop(index - 1)
+        self.deaddrop.drops = list(self.deaddrop_servers)
+        self.save_deaddrop_servers()
+        self.post("success", f"Removed deaddrop server: {removed}")
+
+
+
+
+
     async def on_mount(self):
         
         self.chat_log = self.query_one("#chat_window", RichLog)
@@ -874,6 +1025,8 @@ class I2PChat(App):
                 
             self.my_dest = dest
             
+            self.load_deaddrop_servers()
+            
             # Create SAM socket
             # New i2plib compatibility.
             self.sam_reader, self.sam_writer = await i2plib.create_session(
@@ -940,6 +1093,10 @@ class I2PChat(App):
         if msg.strip() == "/offline":
             if self.conn:
                 self.post("error", "Cannot enter offline mode during active live chat.")
+                return
+            
+            if self.offline_mode:
+                self.post("error", "Already in OFFLINE mode.")
                 return
 
             if not self.offline_ready():
@@ -1075,6 +1232,34 @@ class I2PChat(App):
             await self.send_image(path, mode="bw")
         
         
+        
+        elif msg.strip() == "/dd-list":
+            self.show_deaddrop_servers()
+            return
+
+        elif msg.startswith("/dd-add "):
+            server = msg[len("/dd-add "):].strip()
+            self.add_deaddrop_server(server)
+            return
+
+        elif msg.startswith("/dd-del "):
+            arg = msg[len("/dd-del "):].strip()
+            try:
+                idx = int(arg)
+                self.delete_deaddrop_server_by_index(idx)
+            except ValueError:
+                self.post("error", "Usage: /dd-del <number>")
+            return
+
+        elif msg.strip() == "/dd-share":
+            if not self.conn:
+                self.post("error", "No active connection to share deaddrop servers.")
+                return
+            await self.send_deaddrop_server_list()
+            return
+        
+        
+        
         elif msg.strip() == "/help":
             self.show_help()
             return
@@ -1114,9 +1299,13 @@ class I2PChat(App):
                     send_index = self.drop_send_index
                     dd_key = self.derive_deaddrop_key("send", send_index)
 
-                    status = await self.deaddrop.put(dd_key, blob)
+                    status, ok_drops = await self.deaddrop.put(dd_key, blob)
 
                     if status == "OK":
+                        
+                        if ok_drops:
+                            self.prefer_deaddrop_server(ok_drops[0])
+                        
                         self.drop_send_index += 1
                         self.save_offline_state()
                         self.set_dd_status("put_ok")
@@ -1498,6 +1687,9 @@ class I2PChat(App):
                 
                 if self.offline_ready():
                     asyncio.create_task(self.send_offline_secret_if_needed())
+                    
+                if self.is_persistent_mode():
+                    asyncio.create_task(self.send_deaddrop_server_list())
                 
             except Exception as e:
                 self.post("error", f"E2E key error: {e}")
@@ -1522,7 +1714,24 @@ class I2PChat(App):
                 self.post("system", "Offline secret received and saved.")
             except Exception as e:
                 self.post("error", f"Offline secret handling failed: {e}")
-                
+             
+             
+        elif msg_type == 'L':
+            try:
+                servers = [line.strip() for line in body.splitlines() if line.strip()]
+                if not servers:
+                    return
+
+                changed = self.merge_deaddrop_servers(servers)
+
+                if changed:
+                    self.post("system", f"Merged deaddrop server list from peer. Total: {len(self.deaddrop_servers)}")
+                else:
+                    self.post("system", "Received deaddrop server list from peer (no new entries).")
+            except Exception as e:
+                self.post("error", f"Failed to process deaddrop server list: {e}")     
+             
+             
 
         elif msg_type == 'P':
             if writer is not None:
@@ -1867,7 +2076,11 @@ class I2PChat(App):
 
                         got_valid_blob = False
 
-                        for blob in blobs:
+                        
+                        for drop, blob in blobs:
+                            
+                            self.prefer_deaddrop_server(drop)
+                            
                             try:
                                 blob_hash = hashlib.sha256(blob).hexdigest()
 
@@ -1927,7 +2140,9 @@ class I2PChat(App):
     def show_help(self):
 
         self.post("help", "Command line options:")
+        
         self.post("help", "  Start with --reset <profile> to recreate a persistent profile from scratch")
+        
         
         self.post("help", "Available commands:")
 
@@ -1948,6 +2163,13 @@ class I2PChat(App):
         self.post("help", "Images:")
         self.post("help", "  /img <path>              Send image (braille renderer)")
         self.post("help", "  /img-bw <path>           Send image (block renderer for QR / diagrams)")
+
+        self.post("help", "Deaddrops:")
+        self.post("help", "  /dd-list                  Show known deaddrop servers")
+        self.post("help", "  /dd-add <b32>             Add deaddrop server")
+        self.post("help", "  /dd-del <number>          Remove deaddrop server by list number")
+        self.post("help", "  /dd-share                 Share deaddrop server list with peer")
+
 
         self.post("help", "Utility:")
         self.post("help", "  /help                    Show this help")
