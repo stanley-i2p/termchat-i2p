@@ -27,17 +27,109 @@ As a result, the messenger aims to provide strong privacy, low metadata exposure
 - In the longer term, the Python version is also expected to **move away from `libi2p` entirely** in favor of a cleaner and more controlled implementation path.
 
 
+## Core Architecture
 
+```mermaid
+flowchart TD
 
+    A[User A]
+    B[User B]
+
+    A --> AT[Transient Profile]
+    A --> AP[Persistent Profile]
+
+    B --> BT[Transient Profile]
+    B --> BP[Persistent Profile]
+
+    AT --> ATL[Live 1 to 1 Chat over I2P]
+    BT --> BTL[Live 1 to 1 Chat over I2P]
+    ATL <--> BTL
+
+    AP --> API[Stored Local Identity]
+    AP --> APP[Locked Peer b32.i2p]
+    AP --> ATOFU[TOFU Pinned Peer Destination]
+    AP --> AOFF[Offline State<br/>secret, send index, recv base, window]
+
+    BP --> BPI[Stored Local Identity]
+    BP --> BPP[Locked Peer b32.i2p]
+    BP --> BTOFU[TOFU Pinned Peer Destination]
+    BP --> BOFF[Offline State<br/>secret, send index, recv base, window]
+
+    AP --> APL[Persistent Live Chat over I2P]
+    BP --> BPL[Persistent Live Chat over I2P]
+    APL <--> BPL
+
+    AOFF --> AFRAME[Inner Frame<br/>MAGIC VERSION TYPE MSG_ID LEN PAYLOAD]
+    BOFF --> BFRAME[Inner Frame<br/>MAGIC VERSION TYPE MSG_ID LEN PAYLOAD]
+
+    AFRAME --> ABLOB[Offline Blob<br/>nonce plus encrypted frame]
+    BFRAME --> BBLOB[Offline Blob<br/>nonce plus encrypted frame]
+
+    AOFF --> AKEYS[Derived Per Message Keys<br/>one key equals one blob]
+    BOFF --> BKEYS[Derived Per Message Keys<br/>one key equals one blob]
+
+    DD1[Deaddrop Server 1]
+    DD2[Deaddrop Server 2]
+    DD3[Deaddrop Server 3]
+
+    AKEYS --> APUT[Fresh Transient I2P Destination<br/>for each PUT and GET]
+    BKEYS --> BPUT[Fresh Transient I2P Destination<br/>for each PUT and GET]
+
+    APUT --> DD1
+    APUT --> DD2
+    APUT --> DD3
+
+    BPUT --> DD1
+    BPUT --> DD2
+    BPUT --> DD3
+
+    ABLOB --> DD1
+    ABLOB --> DD2
+    ABLOB --> DD3
+
+    BBLOB --> DD1
+    BBLOB --> DD2
+    BBLOB --> DD3
+
+    DD1 --> AGET[Receiver Window Search<br/>GET candidate keys]
+    DD2 --> AGET
+    DD3 --> AGET
+
+    DD1 --> BGET[Receiver Window Search<br/>GET candidate keys]
+    DD2 --> BGET
+    DD3 --> BGET
+
+    AGET --> ADEC[Hash check duplicate<br/>Decrypt blob<br/>Recover inner frame]
+    BGET --> BDEC[Hash check duplicate<br/>Decrypt blob<br/>Recover inner frame]
+
+    ADEC --> APROC[Process through normal chat handler]
+    BDEC --> BPROC[Process through normal chat handler]
+
+    APL --> ADIFF[Share Known Good Deaddrop List]
+    BPL --> BDIFF[Share Known Good Deaddrop List]
+
+    ADIFF <--> BDIFF
+
+    ADIFF --> DDLISTA[Local Preferred Deaddrop List]
+    BDIFF --> DDLISTB[Local Preferred Deaddrop List]
+
+    subgraph COMP[Compartmentalization]
+        C1[Transient Mode<br/>live only]
+        C2[Persistent Mode<br/>locked peer plus TOFU]
+        C3[Offline Blobs<br/>opaque and metadata poor]
+        C4[One Key Per Message]
+        C5[Fresh I2P Access Identity<br/>per offline PUT and GET]
+    end
+```
 
 
 ## TermchatI2P: Децентрализованный защищенный мессенджер
 
 TermchatI2P — это консольный (TUI) мессенджер, работающий через анонимную сеть **I2P (Invisible Internet Project)**. Проект ориентирован на максимальную приватность, исключая центральные сервера и метаданные.
 
+![TermchatI2P](chat5.png)
 ![TermchatI2P](chat3.png)
 ![TermchatI2P](chat4.png)
-![TermchatI2P](chat.png)
 ![TermchatI2P](chat2.png)
 
 ## 🚀 Быстрый старт
