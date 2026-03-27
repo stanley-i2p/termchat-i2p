@@ -523,26 +523,6 @@ All communication runs over **I2P**.
 
 ---
 
-# Offline Messaging Architecture
-
-## Overview
-
-This chat has two operating modes:
-
-- **Transient mode**
-  - live 1:1 chat only
-  - no offline deaddrop messaging by default
-
-- **Persistent mode**
-  - identity is stored locally
-  - peer is locked to a saved `.b32.i2p`
-  - offline messaging is enabled
-  - offline state is stored per locked peer
-
-All communication runs over **I2P**.
-
----
-
 ## Live Protocol
 
 The inner application frame is:
