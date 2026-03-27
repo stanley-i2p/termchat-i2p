@@ -1,6 +1,10 @@
 import asyncio
 
 
+
+# Need to Unify SAM functionality with sam_client.py
+# Not critical at all
+
 class DeadDropClient:
     def __init__(self, session_id, drops, sam_host="127.0.0.1", sam_port=7656):
         self.session_id = session_id
@@ -116,26 +120,6 @@ class DeadDropClient:
 
 
     
-    # async def put(self, key: str, blob: bytes):
-    #     print("[DD] PUT CALLED")
-    # 
-    #     tasks = [
-    #         asyncio.create_task(self._put_one(drop, key, blob))
-    #         for drop in self.drops
-    #     ]
-    # 
-    #     results = await asyncio.gather(*tasks, return_exceptions=False)
-    # 
-    #     ok_count = sum(1 for r in results if r == "OK")
-    #     exists_count = sum(1 for r in results if r == "EXISTS")
-    # 
-    #     if ok_count > 0:
-    #         return "OK"
-    # 
-    #     if exists_count > 0:
-    #         return "EXISTS"
-    # 
-    #     return "FAIL"
     
     
     async def put(self, key: str, blob: bytes):
@@ -190,15 +174,6 @@ class DeadDropClient:
  
  
  
-    # async def get(self, key: str):
-    #     tasks = [
-    #         asyncio.create_task(self._get_one(drop, key))
-    #         for drop in self.drops
-    #     ]
-    # 
-    #     results = await asyncio.gather(*tasks, return_exceptions=False)
-    # 
-    #     return [data for data in results if data is not None]
     
     
     async def get(self, key: str):

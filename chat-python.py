@@ -1,9 +1,5 @@
-# Python 3.10+ compatibility
-# Use ./libi2p
 import sys, os
 import shutil
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-import i2plib
 
 import asyncio
 from textual.app import App, ComposeResult
@@ -30,6 +26,7 @@ import hashlib
 
 from deaddrop import DeadDropClient
 from e2e import E2E
+from sam_client import SAMClient
 
 
 
@@ -102,8 +99,10 @@ class I2PChat(App):
         self.conn = None  # ACTIVE CHAT
         
         # New i2plib requirement for GC
-        self.sam_reader = None
-        self.sam_writer = None
+        #self.sam_reader = None
+        #self.sam_writer = None
+        
+        self.sam = SAMClient(self.sam_address[0], self.sam_address[1])
         
         self.stored_peer = None
         self.stored_peer_dest_b64 = None
@@ -265,10 +264,10 @@ class I2PChat(App):
             conn_viz = f"[dim]{dot} [dim]STANDBY[/]"
 
         
-        if hasattr(self, 'my_dest'):
-            full_addr = self.my_dest.base32
-            
-            my_b32 = f"{full_addr[:6]}...{full_addr[-6:]}"
+        if hasattr(self, 'my_b32'):
+            full_addr = self.my_b32
+            clean = full_addr.replace(".b32.i2p", "")
+            my_b32 = f"{clean[:6]}...{clean[-6:]}"
         else:
             my_b32 = "----"
     
@@ -313,8 +312,8 @@ class I2PChat(App):
     
 
     def action_copy_my_addr(self) -> None:
-        if hasattr(self, 'my_dest'):
-            addr = self.my_dest.base32 + ".b32.i2p"
+        if hasattr(self, 'my_b32'):
+            addr = self.my_b32
             pyperclip.copy(addr)  # Use xclip automatically
             self.post("success", "Copied to system clipboard!")
 
@@ -538,14 +537,14 @@ class I2PChat(App):
 
 
     def derive_deaddrop_key(self, direction: str, index: int) -> str:
-        if not hasattr(self, "my_dest"):
+        if not hasattr(self, "my_b32"):
             raise RuntimeError("Local destination not ready")
 
         peer_b32 = self.get_offline_peer_b32()
         if not peer_b32:
             raise RuntimeError("Peer address not known for deaddrop key derivation")
 
-        my_b32 = self.my_dest.base32.strip().lower()
+        my_b32 = self.my_b32.replace(".b32.i2p", "").strip().lower()
 
         low_id, high_id = sorted([my_b32, peer_b32])
 
@@ -596,14 +595,14 @@ class I2PChat(App):
 
 
     def get_offline_blob_key(self):
-        if not hasattr(self, "my_dest"):
+        if not hasattr(self, "my_b32"):
             raise RuntimeError("Local destination not ready")
 
         peer_b32 = self.get_offline_peer_b32()
         if not peer_b32:
             raise RuntimeError("Peer address not known for offline blob key")
 
-        my_b32 = self.my_dest.base32.strip().lower()
+        my_b32 = self.my_b32.replace(".b32.i2p", "").strip().lower()
 
         return self.e2e.derive_offline_blob_key(
             self.offline_shared_secret,
@@ -750,14 +749,15 @@ class I2PChat(App):
     
     
     def should_initiate_offline_secret(self) -> bool:
-        if not hasattr(self, "my_dest"):
+        if not hasattr(self, "my_b32"):
             return False
 
         peer_b32 = self.get_offline_peer_b32()
         if not peer_b32:
             return False
 
-        my_b32 = self.my_dest.base32.strip().lower()
+        #my_b32 = self.my_dest.base32.strip().lower()
+        my_b32 = self.my_b32.replace(".b32.i2p", "").strip().lower()
         peer_b32 = peer_b32.strip().lower()
 
         return my_b32 < peer_b32
@@ -986,53 +986,50 @@ class I2PChat(App):
 
         try:
             
-            dest = None
+            my_dest_b64 = None
+            my_pub_dest_b64 = None
+
             # Handle Persistence
             if is_persistent and os.path.exists(key_file):
                 with open(key_file, "r") as f:
                     lines = [line.strip() for line in f.readlines() if line.strip()]
-                    
+
                 if len(lines) > 0:
-                    raw_private_key = lines[0]
-                    dest = i2plib.Destination(raw_private_key, has_private_key=True)
+                    my_dest_b64 = lines[0]
                     self.post("system", f"Loaded identity from {key_file}")
-                
-                
+
                 if len(lines) > 1:
                     self.stored_peer = lines[1]
                     self.post("system", f"Locked Peer: {self.stored_peer}")
-                    
-                    
+
                 if len(lines) > 2:
                     self.stored_peer_dest_b64 = lines[2]
                     fp = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
                     self.post("system", f"TOFU peer pin loaded: {fp}")
-                    
-                    
-                    
-            # Generate new
-            if dest is None:
+
+            await self.sam.connect()
+
+            # Generate new destination if needed
+            if my_dest_b64 is None:
                 self.post("system", "Generating new Ed25519 identity...")
-                dest = await i2plib.new_destination(sam_address=self.sam_address, sig_type=7)
-                
-                
+                my_pub_dest_b64, my_dest_b64 = await self.sam.generate_destination(sig_type=7)
+
                 if is_persistent:
                     with open(key_file, "w") as f:
-                        f.write(dest.private_key.base64 + "\n")
-                        
+                        f.write(my_dest_b64 + "\n")
+
                     self.post("success", f"Identity saved to [cyan]{key_file}[/]")
-                
-                
-            self.my_dest = dest
+                    
+            self.my_dest_b64 = my_dest_b64
             
+            if my_pub_dest_b64:
+                self.my_pub_dest_b64 = my_pub_dest_b64
+
             self.load_deaddrop_servers()
-            
-            # Create SAM socket
-            # New i2plib compatibility.
-            self.sam_reader, self.sam_writer = await i2plib.create_session(
-                self.session_id, 
-                destination=self.my_dest, 
-                sam_address=self.sam_address,
+
+            await self.sam.create_session(
+                self.session_id,
+                destination=my_dest_b64,
                 options={
                     "inbound.length": "2",
                     "outbound.length": "2",
@@ -1040,14 +1037,16 @@ class I2PChat(App):
                     "outbound.quantity": "3"
                 }
             )
-            
-            
+
+            self.my_pub_dest_b64 = await self.sam.naming_lookup("ME")
+            self.my_b32 = self.sam.destination_to_b32(self.my_pub_dest_b64)
             
 
+
             self.network_status = "local_ok"
-            my_address = self.my_dest.base32 + ".b32.i2p"
+            my_address = self.my_b32
             self.post("success", f"Online! My Address: {my_address}")
-            
+
             self.peer_b32 = f"My Addr: {my_address}"
             
             if self.stored_peer:
@@ -1348,16 +1347,14 @@ class I2PChat(App):
             
             self.current_peer_addr = target_address
             
-            reader, writer = await i2plib.stream_connect(
-                self.session_id, target_address, sam_address=self.sam_address
-            )
+            reader, writer = await self.sam.stream_connect(target_address)
             
             
-            if hasattr(self, 'my_dest'):
+            if hasattr(self, 'my_dest_b64'):
                 # Send raw B64 address in single line
-                writer.write(self.my_dest.base64.encode() + b"\n")
+                writer.write(self.my_pub_dest_b64.encode() + b"\n")
                 # Send 'S' frame to sync state machine
-                writer.write(self.frame_message('S', self.my_dest.base64))
+                writer.write(self.frame_message('S', self.my_pub_dest_b64))
                 await writer.drain()
                 
                 # Send E2E key
@@ -1393,7 +1390,8 @@ class I2PChat(App):
                 continue
             
             try:
-                reader, writer = await i2plib.stream_accept(self.session_id, sam_address=self.sam_address)
+                # reader, writer = await i2plib.stream_accept(self.session_id, sam_address=self.sam_address)
+                reader, writer = await self.sam.stream_accept()
                 
                 try:
                     peer_identity_line = await asyncio.wait_for(reader.readline(), timeout=10.0)
@@ -1409,7 +1407,8 @@ class I2PChat(App):
                 
                 try:
                     raw_dest = peer_identity_line.decode().strip()
-                    peer_addr = i2plib.Destination(raw_dest).base32 + ".b32.i2p"
+                    #peer_addr = i2plib.Destination(raw_dest).base32 + ".b32.i2p"
+                    peer_addr = self.sam.destination_to_b32(raw_dest)
                     
                     # If profile is LOCKED, verify calling peer b32
                     if self.stored_peer and peer_addr != self.stored_peer:
@@ -1442,8 +1441,8 @@ class I2PChat(App):
                     peer_addr = "Unknown"
 
                 # Handshake, send OUR identity back in return
-                if hasattr(self, 'my_dest'):
-                    writer.write(self.frame_message('S', self.my_dest.base64))
+                if hasattr(self, 'my_pub_dest_b64'):
+                    writer.write(self.frame_message('S', self.my_pub_dest_b64))
                     await writer.drain()
                     
                     # Send E2E key
@@ -1639,8 +1638,9 @@ class I2PChat(App):
 
             else:
                 try:
-                    dest_obj = i2plib.Destination(body)
-                    peer_addr = dest_obj.base32 + ".b32.i2p"
+                    # dest_obj = i2plib.Destination(body)
+                    # peer_addr = dest_obj.base32 + ".b32.i2p"
+                    peer_addr = self.sam.destination_to_b32(body)
 
                     if self.stored_peer and peer_addr != self.stored_peer:
                         self.post("error", f"Locked peer mismatch: {peer_addr}")
@@ -1741,38 +1741,38 @@ class I2PChat(App):
 
 
 
-
-    async def tunnel_watcher(self):
-        
-        while True:
-            if not hasattr(self, 'my_dest'):
-                await asyncio.sleep(2)
-                continue
-
-            try:
-            
-                await asyncio.wait_for(
-                    i2plib.naming_lookup(
-                        self.my_dest.base32 + ".b32.i2p", 
-                        sam_address=self.sam_address
-                    ), 
-                    timeout=5.0
-                )
-            
-            
-                if self.network_status != "visible":
-                    self.network_status = "visible"
-                    self.post("success", "Tunnels confirmed. You are now [bold green]VISIBLE[/].")
-                
-            except asyncio.TimeoutError:
-            
-                pass
-            except Exception as e:
-            
-                if self.network_status == "visible":
-                    self.network_status = "local_ok"
-                    
-            await asyncio.sleep(20)
+# Will implement after testing phase
+#     async def tunnel_watcher(self):
+#         
+#         while True:
+#             if not hasattr(self, 'my_dest'):
+#                 await asyncio.sleep(2)
+#                 continue
+# 
+#             try:
+#             
+#                 await asyncio.wait_for(
+#                     i2plib.naming_lookup(
+#                         self.my_dest.base32 + ".b32.i2p", 
+#                         sam_address=self.sam_address
+#                     ), 
+#                     timeout=5.0
+#                 )
+#             
+#             
+#                 if self.network_status != "visible":
+#                     self.network_status = "visible"
+#                     self.post("success", "Tunnels confirmed. You are now [bold green]VISIBLE[/].")
+#                 
+#             except asyncio.TimeoutError:
+#             
+#                 pass
+#             except Exception as e:
+#             
+#                 if self.network_status == "visible":
+#                     self.network_status = "local_ok"
+#                     
+#             await asyncio.sleep(20)
 
 
 
@@ -1949,9 +1949,7 @@ class I2PChat(App):
                 pass
             
         try:
-            if self.sam_writer:
-                self.sam_writer.close()
-                await self.sam_writer.wait_closed()
+            await self.sam.close()
         except:
             pass
         
@@ -2052,7 +2050,7 @@ class I2PChat(App):
                     continue
                 
                 
-                if not hasattr(self, "my_dest"):
+                if not hasattr(self, "my_b32"):
                     await asyncio.sleep(5)
                     continue
 

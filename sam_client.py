@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hashlib
 
 
 class SAMClient:
@@ -22,6 +24,72 @@ class SAMClient:
 
         resp = await self.ctrl_reader.readline()
         print("[SAM HELLO]", resp.decode().strip())
+        
+        
+    
+    def destination_to_b32(self, dest_b64: str) -> str:
+        # Replace in destination base64. Uses (- ~) instead of (+ /)
+        std_b64 = dest_b64.replace("-", "+").replace("~", "/")
+        padding = "=" * (-len(std_b64) % 4)
+        raw = base64.b64decode(std_b64 + padding)
+
+        h = hashlib.sha256(raw).digest()
+        b32 = base64.b32encode(h).decode().lower().rstrip("=")
+        return b32 + ".b32.i2p"
+
+
+    async def generate_destination(self, sig_type=7):
+        cmd = f"DEST GENERATE SIGNATURE_TYPE={sig_type}\n"
+        self.ctrl_writer.write(cmd.encode())
+        await self.ctrl_writer.drain()
+
+        resp = await self.ctrl_reader.readline()
+        resp_str = resp.decode().strip()
+        print("[SAM DEST GENERATE]", resp_str)
+
+        parts = resp_str.split()
+
+        pub = None
+        priv = None
+
+        for part in parts:
+            if part.startswith("PUB="):
+                pub = part.split("=", 1)[1]
+            elif part.startswith("PRIV="):
+                priv = part.split("=", 1)[1]
+
+        if not pub or not priv:
+            raise RuntimeError(f"DEST GENERATE failed: {resp_str}")
+
+        return pub, priv
+
+
+    async def naming_lookup(self, name: str) -> str:
+        cmd = f"NAMING LOOKUP NAME={name}\n"
+        self.ctrl_writer.write(cmd.encode())
+        await self.ctrl_writer.drain()
+
+        resp = await self.ctrl_reader.readline()
+        resp_str = resp.decode().strip()
+        print("[SAM LOOKUP]", resp_str)
+
+        parts = resp_str.split()
+
+        result = None
+        value = None
+
+        for part in parts:
+            if part.startswith("RESULT="):
+                result = part.split("=", 1)[1]
+            elif part.startswith("VALUE="):
+                value = part.split("=", 1)[1]
+
+        if result != "OK" or not value:
+            raise RuntimeError(f"NAMING LOOKUP failed: {resp_str}")
+
+        return value
+    
+    
 
     
     # CREATE SESSION
@@ -57,8 +125,15 @@ class SAMClient:
 
         if "RESULT=OK" not in resp_str:
             raise RuntimeError(f"SAM session failed: {resp_str}")
+        
+        destination = None
+        for part in resp_str.split():
+            if part.startswith("DESTINATION="):
+                destination = part.split("=", 1)[1]
+                break
 
-        return resp_str
+        return destination if destination else resp_str
+
 
     
     # STREAM CONNECT
