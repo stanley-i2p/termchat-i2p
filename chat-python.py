@@ -97,10 +97,8 @@ class I2PChat(App):
         self.sam_address = ('127.0.0.1', 7656)
         self.sock = None  # LISTENER
         self.conn = None  # ACTIVE CHAT
+        self.live_ready = False
         
-        # New i2plib requirement for GC
-        #self.sam_reader = None
-        #self.sam_writer = None
         
         self.sam = SAMClient(self.sam_address[0], self.sam_address[1])
         
@@ -1266,7 +1264,9 @@ class I2PChat(App):
                 
         elif msg.strip() == "/disconnect":
             self.run_worker(self.disconnect_peer())
-        elif self.conn:
+            
+            
+        elif self.conn and self.live_ready:
             try:
                 _, writer = self.conn
                 
@@ -1284,6 +1284,10 @@ class I2PChat(App):
             except Exception:
                 self.post("error", "Failed to send message.")
                 self.conn = None
+                self.live_ready = False
+                
+        elif self.conn and not self.live_ready:
+            self.post("error", "Live connection is not ready yet. Wait for secure session to be established.")
                 
         elif self.offline_ready() and self.offline_mode:
             try:
@@ -1368,13 +1372,15 @@ class I2PChat(App):
 
 
             self.conn = (reader, writer)
+            self.live_ready = False
             self.post("success", "Handshake sent. Establishing tunnel...")
             self.run_worker(self.receive_loop(self.conn)) 
             
         
         except Exception as e:
             self.post("error", f"Connection failed: {e}")
-            self.conn = None 
+            self.conn = None
+            self.live_ready = False
             self.post("system", "Waiting for incoming connections...")
         
 
@@ -1390,7 +1396,7 @@ class I2PChat(App):
                 continue
             
             try:
-                # reader, writer = await i2plib.stream_accept(self.session_id, sam_address=self.sam_address)
+                
                 reader, writer = await self.sam.stream_accept()
                 
                 try:
@@ -1407,7 +1413,7 @@ class I2PChat(App):
                 
                 try:
                     raw_dest = peer_identity_line.decode().strip()
-                    #peer_addr = i2plib.Destination(raw_dest).base32 + ".b32.i2p"
+                    
                     peer_addr = self.sam.destination_to_b32(raw_dest)
                     
                     # If profile is LOCKED, verify calling peer b32
@@ -1456,7 +1462,7 @@ class I2PChat(App):
                     self.post("system", "Leaving OFFLINE mode due to live incoming connection.")
 
                 self.conn = (reader, writer)
-
+                self.live_ready = False
                 
                 # Start receiver
                 self.run_worker(self.receive_loop(self.conn))
@@ -1504,6 +1510,7 @@ class I2PChat(App):
                 self.watch_peer_b32(self.peer_b32)
                 
                 self.conn = None
+                self.live_ready = False
                 self.current_peer_dest_b64 = None
                 self.post("disconnect", "Peer disconnected.")
                 self.peer_b32 = "Waiting for incoming connections..."
@@ -1638,8 +1645,7 @@ class I2PChat(App):
 
             else:
                 try:
-                    # dest_obj = i2plib.Destination(body)
-                    # peer_addr = dest_obj.base32 + ".b32.i2p"
+                    
                     peer_addr = self.sam.destination_to_b32(body)
 
                     if self.stored_peer and peer_addr != self.stored_peer:
@@ -1683,6 +1689,7 @@ class I2PChat(App):
         elif msg_type == 'K':
             try:
                 self.e2e.receive_peer_key(payload)
+                self.live_ready = True
                 self.post("system", "Secure session established 🔐")
                 
                 if self.offline_ready():
@@ -1910,6 +1917,7 @@ class I2PChat(App):
             self.watch_peer_b32(self.peer_b32)
             
             self.conn = None
+            self.live_ready = False
             self.current_peer_dest_b64 = None
             self.peer_b32 = "Waiting for incoming connections..."
             self.clear_tofu_runtime_status()

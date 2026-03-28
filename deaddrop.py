@@ -8,9 +8,15 @@ import asyncio
 class DeadDropClient:
     def __init__(self, session_id, drops, sam_host="127.0.0.1", sam_port=7656):
         self.session_id = session_id
+        self.put_session_id = f"{session_id}_put"
+        self.get_session_id = f"{session_id}_get"
+        
         self.drops = drops
         self.sam_host = sam_host
         self.sam_port = sam_port
+        
+        self.put_ctrl_reader = None
+        self.put_ctrl_writer = None
 
         self.ctrl_reader = None
         self.ctrl_writer = None
@@ -22,38 +28,60 @@ class DeadDropClient:
     # Init Session
     
     async def start(self):
-        print("[DD] Starting SAM session:", self.session_id)
+        print("[DD] Starting PUT SAM session:", self.put_session_id)
 
-        self.ctrl_reader, self.ctrl_writer = await asyncio.open_connection(
-            self.sam_host, self.sam_port
-        )
+        self.put_ctrl_reader, self.put_ctrl_writer = await asyncio.open_connection(self.sam_host, self.sam_port)
 
-        
-        self.ctrl_writer.write(b"HELLO VERSION MIN=3.0 MAX=3.2\n")
-        await self.ctrl_writer.drain()
-        resp = await self.ctrl_reader.readline()
-        print("[DD SAM HELLO]", resp.decode().strip())
+        self.put_ctrl_writer.write(b"HELLO VERSION MIN=3.0 MAX=3.2\n")
+        await self.put_ctrl_writer.drain()
+        resp = await self.put_ctrl_reader.readline()
+        print("[DD PUT SAM HELLO]", resp.decode().strip())
 
-        
         cmd = (
             f"SESSION CREATE STYLE=STREAM "
-            f"ID={self.session_id} "
+            f"ID={self.put_session_id} "
             f"DESTINATION=TRANSIENT "
             f"SIGNATURE_TYPE=7 "
             f"OPTION inbound.length=2 outbound.length=2 "
             f"inbound.quantity=2 outbound.quantity=2\n"
         )
 
-        self.ctrl_writer.write(cmd.encode())
-        await self.ctrl_writer.drain()
+        self.put_ctrl_writer.write(cmd.encode())
+        await self.put_ctrl_writer.drain()
 
-        resp = await self.ctrl_reader.readline()
-        print("[DD SESSION]", resp.decode().strip())
+        resp = await self.put_ctrl_reader.readline()
+        print("[DD PUT SESSION]", resp.decode().strip())
+
+        print("[DD] Starting GET SAM session:", self.get_session_id)
+
+        self.get_ctrl_reader, self.get_ctrl_writer = await asyncio.open_connection(
+            self.sam_host, self.sam_port
+        )
+
+        self.get_ctrl_writer.write(b"HELLO VERSION MIN=3.0 MAX=3.2\n")
+        await self.get_ctrl_writer.drain()
+        resp = await self.get_ctrl_reader.readline()
+        print("[DD GET SAM HELLO]", resp.decode().strip())
+
+        cmd = (
+            f"SESSION CREATE STYLE=STREAM "
+            f"ID={self.get_session_id} "
+            f"DESTINATION=TRANSIENT "
+            f"SIGNATURE_TYPE=7 "
+            f"OPTION inbound.length=2 outbound.length=2 "
+            f"inbound.quantity=2 outbound.quantity=2\n"
+        )
+
+        self.get_ctrl_writer.write(cmd.encode())
+        await self.get_ctrl_writer.drain()
+
+        resp = await self.get_ctrl_reader.readline()
+        print("[DD GET SESSION]", resp.decode().strip())
 
     
     # Stream connect
     
-    async def _connect(self, destination):
+    async def _connect(self, destination, mode="put"):
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(self.sam_host, self.sam_port),
             timeout=self.connect_timeout
@@ -65,7 +93,8 @@ class DeadDropClient:
         await asyncio.wait_for(reader.readline(), timeout=self.io_timeout)
         
         # connect
-        cmd = f"STREAM CONNECT ID={self.session_id} DESTINATION={destination}\n"
+        session_id = self.put_session_id if mode == "put" else self.get_session_id
+        cmd = f"STREAM CONNECT ID={session_id} DESTINATION={destination}\n"
 
         print("[DD CONNECT]", cmd.strip())
 
@@ -92,7 +121,7 @@ class DeadDropClient:
             print("[DD] SESSION:", self.session_id)
             print("[DD] KEY:", key)
 
-            reader, writer = await self._connect(drop)
+            reader, writer = await self._connect(drop, mode="put")
 
             writer.write(f"PUT {key} {len(blob)}\n".encode())
             writer.write(blob)
@@ -148,8 +177,9 @@ class DeadDropClient:
     async def _get_one(self, drop: str, key: str):
         try:
             print("[DD GET] CONNECTING TO:", drop)
-
-            reader, writer = await self._connect(drop)
+            
+            print("[DD] SESSION:", self.get_session_id)
+            reader, writer = await self._connect(drop, mode="get")
 
             writer.write(f"GET {key}\n".encode())
             await asyncio.wait_for(writer.drain(), timeout=self.io_timeout)
@@ -190,8 +220,15 @@ class DeadDropClient:
     
     async def close(self):
         try:
-            if self.ctrl_writer:
-                self.ctrl_writer.close()
-                await self.ctrl_writer.wait_closed()
+            if self.put_ctrl_writer:
+                self.put_ctrl_writer.close()
+                await self.put_ctrl_writer.wait_closed()
+        except:
+            pass
+
+        try:
+            if self.get_ctrl_writer:
+                self.get_ctrl_writer.close()
+                await self.get_ctrl_writer.wait_closed()
         except:
             pass
