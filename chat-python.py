@@ -98,6 +98,7 @@ class I2PChat(App):
         self.sock = None  # LISTENER
         self.conn = None  # ACTIVE CHAT
         self.live_ready = False
+        self.publish_ready = False
         
         
         self.sam = SAMClient(self.sam_address[0], self.sam_address[1])
@@ -1042,6 +1043,8 @@ class I2PChat(App):
 
 
             self.network_status = "local_ok"
+            self.publish_ready = self.is_persistent_mode()
+            
             my_address = self.my_b32
             self.post("success", f"Online! My Address: {my_address}")
 
@@ -1057,6 +1060,7 @@ class I2PChat(App):
                 self.post("system", "Waiting for incoming connections...")
 
             self.run_worker(self.accept_loop())
+            self.run_worker(self.tunnel_watcher())
             
             if self.offline_ready():
                 # Start Deaddrop raw SAM session
@@ -1110,6 +1114,11 @@ class I2PChat(App):
             if self.conn:
                 self.post("error", "Already connected. Use /disconnect first.")
                 return
+            
+            if not self.is_persistent_mode() and not self.publish_ready:
+                self.post("error", "Transient tunnels are still publishing. Wait a few seconds and try again.")
+                return
+            
             
             if self.offline_mode:
                 self.leave_offline_mode()
@@ -1748,38 +1757,29 @@ class I2PChat(App):
 
 
 
-# Will implement after testing phase
-#     async def tunnel_watcher(self):
-#         
-#         while True:
-#             if not hasattr(self, 'my_dest'):
-#                 await asyncio.sleep(2)
-#                 continue
-# 
-#             try:
-#             
-#                 await asyncio.wait_for(
-#                     i2plib.naming_lookup(
-#                         self.my_dest.base32 + ".b32.i2p", 
-#                         sam_address=self.sam_address
-#                     ), 
-#                     timeout=5.0
-#                 )
-#             
-#             
-#                 if self.network_status != "visible":
-#                     self.network_status = "visible"
-#                     self.post("success", "Tunnels confirmed. You are now [bold green]VISIBLE[/].")
-#                 
-#             except asyncio.TimeoutError:
-#             
-#                 pass
-#             except Exception as e:
-#             
-#                 if self.network_status == "visible":
-#                     self.network_status = "local_ok"
-#                     
-#             await asyncio.sleep(20)
+    async def tunnel_watcher(self):
+        while True:
+            if not hasattr(self, "my_b32"):
+                await asyncio.sleep(2)
+                continue
+
+            try:
+                await asyncio.wait_for(
+                    self.sam.naming_lookup(self.my_b32),
+                    timeout=5.0
+                )
+
+                if not self.publish_ready:
+                    self.publish_ready = True
+                    self.network_status = "visible"
+                    self.post("success", "Tunnels confirmed. You can now initiate live connections.")
+
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+
+            await asyncio.sleep(5)
 
 
 
