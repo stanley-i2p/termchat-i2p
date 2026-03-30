@@ -29,7 +29,7 @@ source "$HOME/.cargo/env"
 
 * DeadDrop Server project setup
 
-    - Create project structure:
+1. Create project structure:
 
 ```bash
 cargo new deaddrop-server-rust
@@ -37,9 +37,9 @@ cargo new deaddrop-server-rust
 
 (You can use any name you want. Make sure to match with Cargo.toml)
 
-    - Overwrite **main.rs** and **Cargo.toml** with files provided in repo.
+2. Overwrite **main.rs** and **Cargo.toml** with files provided in repo.
 
-    - Build and execute
+3. Build and execute
 
 ```bash
 cargo build --release
