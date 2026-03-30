@@ -12,6 +12,7 @@ BASE_DIR = os.path.expanduser("~/.termchat-server")
 IDENTITY_DIR = os.path.join(BASE_DIR, "identities")
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 
+
 # PLEASE: for Production try to use 1.
 # Having multiple instances of deaddrop-server on 1 physical server will
 # NOT increase fault tolerance of overall offline ecosystem.
@@ -34,16 +35,22 @@ BLOB_TTL_SECONDS = 14 * 24 * 60 * 60   # 14 days ?
 GC_INTERVAL_SECONDS = 60 * 60          # 1 hour ?
 
 
+def drop_storage_dir(drop_name: str):
+    return os.path.join(STORAGE_DIR, drop_name)
 
 
 def ensure_dirs():
     os.makedirs(IDENTITY_DIR, exist_ok=True)
     os.makedirs(STORAGE_DIR, exist_ok=True)
 
+    for i in range(NUM_DROPS):
+        drop_name = f"drop_{i}"
+        os.makedirs(drop_storage_dir(drop_name), exist_ok=True)
 
-def blob_path(key: str):
+
+def blob_path(drop_name: str, key: str):
     h = hashlib.sha256(key.encode()).hexdigest()
-    sub = os.path.join(STORAGE_DIR, h[:2])
+    sub = os.path.join(drop_storage_dir(drop_name), h[:2])
     os.makedirs(sub, exist_ok=True)
     return os.path.join(sub, h)
 
@@ -64,21 +71,26 @@ async def gc_loop():
             now = asyncio.get_running_loop().time()
             deleted = 0
 
-            for root, _, files in os.walk(STORAGE_DIR):
-                for name in files:
-                    path = os.path.join(root, name)
+            for i in range(NUM_DROPS):
+                drop_name = f"drop_{i}"
+                drop_root = drop_storage_dir(drop_name)
 
-                    try:
-                        st = os.stat(path)
-                        age = time.time() - st.st_mtime
+                for root, _, files in os.walk(drop_root):
+                    for name in files:
+                        path = os.path.join(root, name)
 
-                        if age > BLOB_TTL_SECONDS:
-                            os.remove(path)
-                            deleted += 1
-                    except FileNotFoundError:
-                        continue
-                    except Exception as e:
-                        print(f"[GC] failed to remove {path}: {e}")
+                        try:
+                            st = os.stat(path)
+                            age = time.time() - st.st_mtime
+
+                            if age > BLOB_TTL_SECONDS:
+                                os.remove(path)
+                                deleted += 1
+                        except FileNotFoundError:
+                            continue
+                        except Exception as e:
+                            print(f"[GC] failed to remove {path}: {e}")
+
 
             if deleted:
                 print(f"[GC] removed {deleted} expired blobs")
@@ -96,19 +108,19 @@ async def gc_loop():
 # Storage Protocol
 
 
-async def handle_client(reader, writer):
+async def handle_client(drop_name, reader, writer):
 
     try:
         line = await reader.readline()
         
-        print(f"[SERVER] raw line: {line}")
+        #print(f"[SERVER] raw line: {line}")
         
         if not line:
             return
 
         parts = line.decode(errors="ignore").strip().split()
         
-        print(f"[SERVER] parsed: {parts}")
+        #print(f"[SERVER] parsed: {parts}")
 
         if not parts:
             return
@@ -123,21 +135,21 @@ async def handle_client(reader, writer):
             key = parts[1]
             size = int(parts[2])
 
-            print(f"[SERVER] PUT key={key} size={size}")
+            #print(f"[SERVER] PUT key={key} size={size}")
 
             data = await reader.readexactly(size)
 
-            path = blob_path(key)
+            path = blob_path(drop_name, key)
 
             if os.path.exists(path):
-                print(f"[SERVER] PUT exists key={key}")
                 writer.write(b"EXISTS\n")
+                print(f"[{drop_name}] PUT key={key} size={size} result=EXISTS")
             else:
                 with open(path, "wb") as f:
                     f.write(data)
 
                 writer.write(b"OK\n")
-                print("[SERVER] PUT stored and ACK sent")
+                print(f"[{drop_name}] PUT key={key} size={size} result=OK")
 
         
         # GET CMD
@@ -145,11 +157,11 @@ async def handle_client(reader, writer):
         elif cmd == "GET" and len(parts) >= 2:
 
             key = parts[1]
-            path = blob_path(key)
+            path = blob_path(drop_name, key)
 
             if not os.path.exists(path):
-                print(f"[SERVER] GET miss key={key}")
                 writer.write(b"MISS\n")
+                print(f"[{drop_name}] GET key={key} result=MISS")
 
             else:
                 try:
@@ -158,21 +170,22 @@ async def handle_client(reader, writer):
                     if age > BLOB_TTL_SECONDS:
                         try:
                             os.remove(path)
-                            print(f"[SERVER] GET expired key={key} removed")
                         except FileNotFoundError:
                             pass
 
                         writer.write(b"MISS\n")
+                        print(f"[{drop_name}] GET key={key} result=MISS_EXPIRED")
                     else:
                         with open(path, "rb") as f:
                             data = f.read()
 
-                        print(f"[SERVER] GET hit key={key} size={len(data)}")
                         writer.write(f"OK {len(data)}\n".encode())
                         writer.write(data)
+                        print(f"[{drop_name}] GET key={key} size={len(data)} result=OK")
 
                 except FileNotFoundError:
                     writer.write(b"MISS\n")
+                    print(f"[{drop_name}] GET key={key} result=MISS")
 
         else:
             writer.write(b"ERR\n")
@@ -308,7 +321,7 @@ async def accept_loop(name):
                 await asyncio.sleep(1)
                 continue
 
-            print(f"[{name}] waiting...")
+            #print(f"[{name}] waiting...")
 
             # Wait for incoming connection
             dest_line = await reader.readline()
@@ -316,10 +329,10 @@ async def accept_loop(name):
             if not dest_line:
                 continue
 
-            print(f"[{name}] incoming from: {dest_line[:60]}")
+            #print(f"[{name}] incoming from: {dest_line[:60]}")
 
             
-            await handle_client(reader, writer)
+            await handle_client(name, reader, writer)
 
         except asyncio.CancelledError:
             break
