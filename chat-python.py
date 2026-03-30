@@ -1,5 +1,6 @@
 import sys, os
 import shutil
+import stat
 
 import asyncio
 from textual.app import App, ComposeResult
@@ -46,15 +47,66 @@ Image.MAX_IMAGE_PIXELS = 20_000_000
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".termchat-i2p")
 BASE_DIR = os.path.abspath(BASE_DIR)
 
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+
+try:
+    os.umask(0o077)
+except:
+    pass
+
+
+def secure_makedirs(path: str):
+    os.makedirs(path, mode=DIR_MODE, exist_ok=True)
+    try:
+        os.chmod(path, DIR_MODE)
+    except:
+        pass
+
+
+def secure_write_text(path: str, text: str, mode: str = "w"):
+    with open(path, mode) as f:
+        f.write(text)
+    try:
+        os.chmod(path, FILE_MODE)
+    except:
+        pass
+
+
+def secure_append_text(path: str, text: str):
+    with open(path, "a") as f:
+        f.write(text)
+    try:
+        os.chmod(path, FILE_MODE)
+    except:
+        pass
+
+
+def secure_delete_profile(profile_name: str):
+    profile_dir = os.path.join(BASE_DIR, "profiles", os.path.basename(profile_name))
+    if os.path.exists(profile_dir):
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        print(f"[OK] Deleted profile: {profile_name}")
+    else:
+        print(f"[INFO] Profile does not exist: {profile_name}")
+
+
 RESET_PROFILE = False
+DELETE_PROFILE = False
 
 if len(sys.argv) > 2 and sys.argv[1] == "--reset":
     RESET_PROFILE = True
     PROFILE_NAME = os.path.basename(sys.argv[2])
+    
+elif len(sys.argv) > 2 and sys.argv[1] == "--delete":
+    DELETE_PROFILE = True
+    PROFILE_NAME = os.path.basename(sys.argv[2])
+    
 elif len(sys.argv) > 1:
     PROFILE_NAME = os.path.basename(sys.argv[1])
 else:
     PROFILE_NAME = "default"
+    
 
 PROFILE_DIR = os.path.join(BASE_DIR, "profiles", PROFILE_NAME)
 
@@ -62,13 +114,22 @@ IMAGE_DIR = os.path.join(BASE_DIR, "images")
 FILE_DIR = os.path.join(BASE_DIR, "files")
 BLOB_DIR = os.path.join(BASE_DIR, "blobs")
 
+
+
+if DELETE_PROFILE:
+    secure_delete_profile(PROFILE_NAME)
+    sys.exit(0)
+
 if RESET_PROFILE and os.path.exists(PROFILE_DIR):
     shutil.rmtree(PROFILE_DIR, ignore_errors=True)
 
-os.makedirs(PROFILE_DIR, exist_ok=True)
-os.makedirs(IMAGE_DIR, exist_ok=True)
-os.makedirs(FILE_DIR, exist_ok=True)
-os.makedirs(BLOB_DIR, exist_ok=True)
+secure_makedirs(PROFILE_DIR)
+secure_makedirs(IMAGE_DIR)
+secure_makedirs(FILE_DIR)
+secure_makedirs(BLOB_DIR)
+
+
+
 
 
 class I2PChat(App):
@@ -694,16 +755,14 @@ class I2PChat(App):
         try:
             path = self.offline_state_path()
 
-            with open(path, "w") as f:
-                f.write(f"offline_shared_secret={self.offline_shared_secret.hex()}\n")
-                f.write(f"drop_send_index={self.drop_send_index}\n")
-                f.write(f"drop_recv_base={self.drop_recv_base}\n")
-                f.write(f"drop_window={self.drop_window}\n")
-                f.write(
-                    "consumed_drop_recv="
-                    + ",".join(str(x) for x in sorted(self.consumed_drop_recv))
-                    + "\n"
-                )
+            content = ""
+            content += f"offline_shared_secret={self.offline_shared_secret.hex()}\n"
+            content += f"drop_send_index={self.drop_send_index}\n"
+            content += f"drop_recv_base={self.drop_recv_base}\n"
+            content += f"drop_window={self.drop_window}\n"
+            content += "consumed_drop_recv=" + ",".join(str(x) for x in sorted(self.consumed_drop_recv)) + "\n"
+
+            secure_write_text(path, content)
 
         except Exception as e:
             self.post("error", f"Failed to save offline state: {e}")
@@ -848,9 +907,10 @@ class I2PChat(App):
 
         try:
             path = self.deaddrop_servers_path()
-            with open(path, "w") as f:
-                for s in self.deaddrop_servers:
-                    f.write(s + "\n")
+            
+            content = "".join(s + "\n" for s in self.deaddrop_servers)
+            secure_write_text(path, content)
+            
         except Exception as e:
             self.post("error", f"Failed to save deaddrop servers: {e}")
 
@@ -895,7 +955,7 @@ class I2PChat(App):
 
         host = server[:-8]  # strip ".b32.i2p"
 
-        if len(host) < 20:
+        if len(host) not in (52, 56):
             return False
 
         allowed = set("abcdefghijklmnopqrstuvwxyz234567")
@@ -1014,8 +1074,8 @@ class I2PChat(App):
                 my_pub_dest_b64, my_dest_b64 = await self.sam.generate_destination(sig_type=7)
 
                 if is_persistent:
-                    with open(key_file, "w") as f:
-                        f.write(my_dest_b64 + "\n")
+                    
+                    secure_write_text(key_file, my_dest_b64 + "\n")
 
                     self.post("success", f"Identity saved to [cyan]{key_file}[/]")
                     
@@ -1163,9 +1223,10 @@ class I2PChat(App):
                         self.post("error", "Peer full destination not yet known for TOFU pinning.")
                         return
 
-                    with open(key_file, "a") as f:
-                        f.write(self.current_peer_addr + "\n")
-                        f.write(self.current_peer_dest_b64 + "\n")
+                    secure_append_text(
+                        key_file,
+                        self.current_peer_addr + "\n" + self.current_peer_dest_b64 + "\n"
+                    )
 
                     self.stored_peer = self.current_peer_addr
                     self.stored_peer_dest_b64 = self.current_peer_dest_b64
@@ -1310,6 +1371,7 @@ class I2PChat(App):
                 for _ in range(max_attempts):
                     send_index = self.drop_send_index
                     dd_key = self.derive_deaddrop_key("send", send_index)
+                    
 
                     status, ok_drops = await self.deaddrop.put(dd_key, blob)
 
