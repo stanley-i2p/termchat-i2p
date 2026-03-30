@@ -1163,6 +1163,11 @@ class I2PChat(App):
             if not self.offline_ready():
                 self.post("error", "Offline mode requires persistent mode with a locked peer.")
                 return
+            
+            if not self.deaddrop_started or not self.deaddrop_poller_started:
+                self.post("system", "Starting offline runtime...")
+                await self.ensure_offline_runtime_started()
+            
 
             self.offline_mode = True
             self.watch_peer_b32(self.peer_b32)
@@ -1239,8 +1244,10 @@ class I2PChat(App):
                     self.consumed_drop_recv = set()
 
                     self.save_offline_state()
+                    
+                    self.watch_peer_b32(self.peer_b32)
 
-                    await self.ensure_offline_runtime_started()
+                    #await self.ensure_offline_runtime_started()
 
                     fp = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
                     self.post("success", f"Profile [bold yellow]{self.profile}[/] is now locked to this peer.")
@@ -2210,6 +2217,7 @@ class I2PChat(App):
         self.post("help", "Command line options:")
         
         self.post("help", "  Start with --reset <profile> to recreate a persistent profile from scratch")
+        self.post("help", "  Start with --delete <profile> to deletes profile completely")
         
         
         self.post("help", "Available commands:")
@@ -2233,10 +2241,10 @@ class I2PChat(App):
         self.post("help", "  /img-bw <path>           Send image (block renderer for QR / diagrams)")
 
         self.post("help", "Deaddrops:")
-        self.post("help", "  /dd-list                  Show known deaddrop servers")
-        self.post("help", "  /dd-add <b32>             Add deaddrop server")
-        self.post("help", "  /dd-del <number>          Remove deaddrop server by list number")
-        self.post("help", "  /dd-share                 Share deaddrop server list with peer")
+        self.post("help", "  /dd-list                 Show known deaddrop servers")
+        self.post("help", "  /dd-add <b32>            Add deaddrop server")
+        self.post("help", "  /dd-del <number>         Remove deaddrop server by list number")
+        self.post("help", "  /dd-share                Share deaddrop server list with peer")
 
 
         self.post("help", "Utility:")
