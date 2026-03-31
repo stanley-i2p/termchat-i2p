@@ -118,7 +118,7 @@ class DeadDropClient:
     async def _put_one(self, drop: str, key: str, blob: bytes):
         try:
             print("[DD] CONNECTING TO:", drop)
-            print("[DD] SESSION:", self.session_id)
+            print("[DD] SESSION:", self.put_session_id)
             print("[DD] KEY:", key)
 
             reader, writer = await self._connect(drop, mode="put")

@@ -1,6 +1,7 @@
 import sys, os
 import shutil
 import stat
+import getpass
 
 import asyncio
 from textual.app import App, ComposeResult
@@ -28,6 +29,8 @@ import hashlib
 from deaddrop import DeadDropClient
 from e2e import E2E
 from sam_client import SAMClient
+
+from vault import fs_decrypt, fs_encrypt, fs_runtime_enter, fs_runtime_leave, fs_verify_passphrase
 
 
 
@@ -116,6 +119,19 @@ BLOB_DIR = os.path.join(BASE_DIR, "blobs")
 
 
 
+
+FS_PASSPHRASE = getpass.getpass("Enter filesystem passphrase: ")
+
+vault_path = BASE_DIR + ".vault"
+
+if os.path.exists(vault_path):
+    if os.path.exists(BASE_DIR):
+        if not fs_verify_passphrase(BASE_DIR, FS_PASSPHRASE):
+            print("[FS ERROR] Wrong filesystem passphrase.")
+            sys.exit(1)
+    else:
+        fs_decrypt(BASE_DIR, FS_PASSPHRASE)
+
 if DELETE_PROFILE:
     secure_delete_profile(PROFILE_NAME)
     sys.exit(0)
@@ -127,6 +143,8 @@ secure_makedirs(PROFILE_DIR)
 secure_makedirs(IMAGE_DIR)
 secure_makedirs(FILE_DIR)
 secure_makedirs(BLOB_DIR)
+
+FS_INSTANCE_COUNT = fs_runtime_enter(BASE_DIR)
 
 
 
@@ -2255,7 +2273,24 @@ class I2PChat(App):
 
 
 
+# if __name__ == "__main__":
+#     app = I2PChat()
+#     app.run()
+
 if __name__ == "__main__":
-    app = I2PChat()
-    app.run()
+    app = None
+
+    try:
+        app = I2PChat()
+        app.run()
+    finally:
+        if os.path.exists(BASE_DIR):
+            try:
+                remaining = fs_runtime_leave(BASE_DIR)
+
+                if remaining == 0:
+                    fs_encrypt(BASE_DIR, FS_PASSPHRASE)
+                    print("[OK] Filesystem storage encrypted.")
+            except Exception as e:
+                print(f"[FS_ENCRYPT ERROR] Failed to encrypt storage: {e}")
 
