@@ -92,6 +92,19 @@ def secure_delete_profile(profile_name: str):
         print(f"[OK] Deleted profile: {profile_name}")
     else:
         print(f"[INFO] Profile does not exist: {profile_name}")
+        
+
+def ensure_deaddrop_bootstrap_file():
+    if os.path.exists(DD_BOOTSTRAP_FILE):
+        return
+
+    content = (
+        "62afc5yf2lcthx44okvavvmvgb55cee3weqeqhuapcclz6evwyrq.b32.i2p\n"
+        "x75crc4lkcd3xcfrj5sox662mujngzrtmvmejaixutdozg35fgvq.b32.i2p\n"
+        "xxbgj3dlw7fvwz3emqnvyzxrdj3vqd3fcdw6rutmvzoxidyhp7bq.b32.i2p\n"
+    )
+
+    secure_write_text(DD_BOOTSTRAP_FILE, content)
 
 
 RESET_PROFILE = False
@@ -116,6 +129,8 @@ PROFILE_DIR = os.path.join(BASE_DIR, "profiles", PROFILE_NAME)
 IMAGE_DIR = os.path.join(BASE_DIR, "images")
 FILE_DIR = os.path.join(BASE_DIR, "files")
 BLOB_DIR = os.path.join(BASE_DIR, "blobs")
+
+DD_BOOTSTRAP_FILE = os.path.join(BASE_DIR, "deaddrop_servers.bootstrap.txt")
 
 
 
@@ -143,6 +158,8 @@ secure_makedirs(PROFILE_DIR)
 secure_makedirs(IMAGE_DIR)
 secure_makedirs(FILE_DIR)
 secure_makedirs(BLOB_DIR)
+
+ensure_deaddrop_bootstrap_file()
 
 FS_INSTANCE_COUNT = fs_runtime_enter(BASE_DIR)
 
@@ -221,10 +238,14 @@ class I2PChat(App):
         
         self.e2e = E2E()
         
-        # Dеaddrop (Phase 1)
-        self.deaddrop_servers = ["62afc5yf2lcthx44okvavvmvgb55cee3weqeqhuapcclz6evwyrq.b32.i2p",
-             "x75crc4lkcd3xcfrj5sox662mujngzrtmvmejaixutdozg35fgvq.b32.i2p", "xxbgj3dlw7fvwz3emqnvyzxrdj3vqd3fcdw6rutmvzoxidyhp7bq.b32.i2p"
-        ]
+        # # Dеaddrop (Phase 1)
+        # self.deaddrop_servers = ["62afc5yf2lcthx44okvavvmvgb55cee3weqeqhuapcclz6evwyrq.b32.i2p",
+        #      "x75crc4lkcd3xcfrj5sox662mujngzrtmvmejaixutdozg35fgvq.b32.i2p", "xxbgj3dlw7fvwz3emqnvyzxrdj3vqd3fcdw6rutmvzoxidyhp7bq.b32.i2p"
+        # ]
+        
+        # Deaddrop servers, profile specific, loaded from file
+        self.deaddrop_servers = []
+        
         
         
         self.deaddrop = DeadDropClient(
@@ -884,9 +905,34 @@ class I2PChat(App):
 
 
 
+    def ensure_profile_deaddrop_servers_file(self):
+        if not self.is_persistent_mode():
+            return
+
+        path = self.deaddrop_servers_path()
+        if os.path.exists(path):
+            return
+
+        if not os.path.exists(DD_BOOTSTRAP_FILE):
+            return
+
+        try:
+            with open(DD_BOOTSTRAP_FILE, "r") as f:
+                content = f.read()
+
+            secure_write_text(path, content)
+            self.post("system", "Initialized deaddrop server list from bootstrap defaults.")
+            
+        except Exception as e:
+            self.post("error", f"Failed to initialize deaddrop server list from bootstrap: {e}")
+
+
+
+
     def deaddrop_servers_path(self) -> str:
         return os.path.join(PROFILE_DIR, "deaddrop_servers.txt")
-
+    
+    
 
     def load_deaddrop_servers(self):
         if not self.is_persistent_mode():
@@ -1101,6 +1147,9 @@ class I2PChat(App):
             
             if my_pub_dest_b64:
                 self.my_pub_dest_b64 = my_pub_dest_b64
+
+
+            self.ensure_profile_deaddrop_servers_file()
 
             self.load_deaddrop_servers()
 
