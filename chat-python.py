@@ -204,6 +204,13 @@ class I2PChat(App):
         self.current_peer_addr = None
         self.current_peer_dest_b64 = None
         
+        self.pending_incoming_conn = None
+        self.pending_incoming_addr = None
+        self.pending_incoming_dest_b64 = None
+        self.pending_incoming_task = None
+        self.promoting_pending_incoming = False
+        self.call_blink_on = True
+        
         self.tofu_verified = False
         self.tofu_mismatch = False
         
@@ -238,10 +245,7 @@ class I2PChat(App):
         
         self.e2e = E2E()
         
-        # # Dеaddrop (Phase 1)
-        # self.deaddrop_servers = ["62afc5yf2lcthx44okvavvmvgb55cee3weqeqhuapcclz6evwyrq.b32.i2p",
-        #      "x75crc4lkcd3xcfrj5sox662mujngzrtmvmejaixutdozg35fgvq.b32.i2p", "xxbgj3dlw7fvwz3emqnvyzxrdj3vqd3fcdw6rutmvzoxidyhp7bq.b32.i2p"
-        # ]
+        
         
         # Deaddrop servers, profile specific, loaded from file
         self.deaddrop_servers = []
@@ -333,7 +337,9 @@ class I2PChat(App):
         
         lock_tag = " [black on green] LOCK [/]" if self.stored_peer else " [black on red] UNLOCK [/]"
         
-        if self.tofu_mismatch:
+        if self.offline_mode:
+            tofu_tag = ""
+        elif self.tofu_mismatch:
             tofu_tag = " [black on red] TOFU [/]"
         elif self.tofu_verified:
             tofu_tag = " [black on green] TOFU [/]"
@@ -345,7 +351,13 @@ class I2PChat(App):
         dd_label = self.get_dd_status_label()
         dd_tag = f" {dd_label}" if self.offline_mode and dd_label else ""
         
-        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{lock_tag}{tofu_tag}{offline_tag}{dd_tag}"
+        #call_tag = " [black on magenta] CALL [/]" if self.pending_incoming_conn else ""
+        if self.pending_incoming_conn:
+            call_tag = " [black on cyan] INCOMING CALL [/]" if self.call_blink_on else " [black on grey62] CALL [/]"
+        else:
+            call_tag = ""
+        
+        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{lock_tag}{tofu_tag}{offline_tag}{dd_tag}{call_tag}"
         
         transfer = self.get_file_transfer_status()
         #dd_label = self.get_dd_status_label()
@@ -596,6 +608,246 @@ class I2PChat(App):
         self.tofu_verified = False
         self.tofu_mismatch = False
         self.watch_peer_b32(self.peer_b32)
+
+
+    def clear_pending_incoming(self):
+        self.pending_incoming_conn = None
+        self.pending_incoming_addr = None
+        self.pending_incoming_dest_b64 = None
+        self.watch_peer_b32(self.peer_b32)
+        
+        
+        
+    def pending_incoming_is_dead(self) -> bool:
+        if not self.pending_incoming_conn:
+            return True
+
+        reader, writer = self.pending_incoming_conn
+
+        try:
+            if writer.is_closing():
+                return True
+        except:
+            return True
+
+        try:
+            if reader.at_eof():
+                return True
+        except:
+            return True
+
+        return False
+        
+    
+    
+    async def pending_receive_loop(self, connection):
+        reader, writer = connection
+
+        try:
+            while self.pending_incoming_conn == connection:
+                try:
+                    msg_type, msg_id, payload = await self.read_frame(reader)
+
+                    if msg_type not in ('K', 'P', 'O', 'S', 'D'):
+                        payload = self.e2e.decrypt(payload)
+
+                except UnicodeDecodeError:
+                    continue
+                except ValueError:
+                    continue
+
+                await self.handle_parsed_frame(
+                    msg_type,
+                    msg_id,
+                    payload,
+                    writer=writer,
+                    source="pending"
+                )
+
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass
+
+        except asyncio.CancelledError:
+            pass
+
+        except Exception as e:
+            if self.pending_incoming_conn == connection:
+                self.post("error", f"Pending call error: {e}")
+
+        finally:
+            if not self.promoting_pending_incoming:
+                if self.pending_incoming_conn == connection:
+                    caller = self.pending_incoming_addr or "Unknown"
+                    
+                    self.clear_pending_incoming()
+                    self.current_peer_addr = None
+                    self.current_peer_dest_b64 = None
+                    self.peer_b32 = "Waiting for incoming connections..."
+                    self.clear_tofu_runtime_status()
+                    
+                    self.post("system", f"Incoming caller disconnected: {caller[:12]}...")
+
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except:
+                        pass
+
+            self.pending_incoming_task = None
+    
+    
+    
+    async def accept_pending_incoming(self):
+        if not self.pending_incoming_conn:
+            self.post("error", "No incoming call to accept.")
+            return
+
+        if self.pending_incoming_is_dead():
+            
+            self.clear_pending_incoming()
+            self.current_peer_addr = None
+            self.current_peer_dest_b64 = None
+            self.peer_b32 = "Waiting for incoming connections..."
+            self.clear_tofu_runtime_status()
+            
+            self.post("error", "Incoming caller disconnected.")
+            return
+
+        reader, writer = self.pending_incoming_conn
+        accepted_from = self.pending_incoming_addr or "Unknown"
+        accepted_dest_b64 = self.pending_incoming_dest_b64
+
+        self.promoting_pending_incoming = True
+
+        task = self.pending_incoming_task
+        self.pending_incoming_task = None
+
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except:
+                pass
+
+        self.clear_pending_incoming()
+
+        self.current_peer_addr = accepted_from
+        self.current_peer_dest_b64 = accepted_dest_b64
+        self.peer_b32 = accepted_from or "Unknown"
+
+        if accepted_dest_b64 and self.stored_peer_dest_b64:
+            self.set_tofu_verified()
+        else:
+            self.clear_tofu_runtime_status()
+
+        if hasattr(self, 'my_pub_dest_b64'):
+            writer.write(self.frame_message('S', self.my_pub_dest_b64))
+            await writer.drain()
+
+            writer.write(self.frame_message('K', self.e2e.public_bytes()))
+            await writer.drain()
+
+        if self.offline_mode:
+            self.leave_offline_mode()
+            self.watch_peer_b32(self.peer_b32)
+            self.post("system", "Leaving OFFLINE mode due to accepted live incoming connection.")
+
+        self.conn = (reader, writer)
+        self.live_ready = self.e2e.ready()
+
+        self.promoting_pending_incoming = False
+
+        self.post("success", f"Accepted incoming call from {accepted_from[:12]}...")
+
+        if self.live_ready:
+            self.post("system", "Secure session established 🔐")
+
+        self.run_worker(self.receive_loop(self.conn))
+    
+
+
+    async def decline_pending_incoming(self):
+        if not self.pending_incoming_conn:
+            self.post("error", "No incoming call to decline.")
+            return
+
+        if self.pending_incoming_is_dead():
+            
+            self.clear_pending_incoming()
+            self.current_peer_addr = None
+            self.current_peer_dest_b64 = None
+            self.peer_b32 = "Waiting for incoming connections..."
+            self.clear_tofu_runtime_status()
+            
+            self.post("system", "Incoming caller already disconnected.")
+            return
+
+        _, writer = self.pending_incoming_conn
+        declined_from = self.pending_incoming_addr or "Unknown"
+
+        self.promoting_pending_incoming = True
+
+        task = self.pending_incoming_task
+        self.pending_incoming_task = None
+
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except:
+                pass
+
+        self.clear_pending_incoming()
+        self.current_peer_addr = None
+        self.current_peer_dest_b64 = None
+        self.peer_b32 = "Waiting for incoming connections..."
+        self.clear_tofu_runtime_status()
+
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except:
+            pass
+
+        self.promoting_pending_incoming = False
+
+        self.post("system", f"Declined incoming call from {declined_from[:12]}...")
+
+
+
+    async def call_blink_worker(self):
+        while True:
+            try:
+                if self.pending_incoming_conn:
+                    self.call_blink_on = not self.call_blink_on
+                    self.watch_peer_b32(self.peer_b32)
+                else:
+                    if not self.call_blink_on:
+                        self.call_blink_on = True
+                        self.watch_peer_b32(self.peer_b32)
+            except:
+                pass
+
+            await asyncio.sleep(1)
+
+
+
+    async def pending_incoming_watch_worker(self):
+        while True:
+            try:
+                if self.pending_incoming_conn and self.pending_incoming_is_dead():
+                    caller = self.pending_incoming_addr or "Unknown"
+                    self.clear_pending_incoming()
+                    self.post("system", f"Incoming caller disconnected: {caller[:12]}...")
+            except:
+                pass
+
+            await asyncio.sleep(1)
+
 
 
 
@@ -853,7 +1105,7 @@ class I2PChat(App):
         if not peer_b32:
             return False
 
-        #my_b32 = self.my_dest.base32.strip().lower()
+        
         my_b32 = self.my_b32.replace(".b32.i2p", "").strip().lower()
         peer_b32 = peer_b32.strip().lower()
 
@@ -1097,7 +1349,6 @@ class I2PChat(App):
         
         
         
-        #is_persistent = len(sys.argv) > 1
         is_persistent = self.profile != "default"
         
         
@@ -1188,6 +1439,8 @@ class I2PChat(App):
 
             self.run_worker(self.accept_loop())
             self.run_worker(self.tunnel_watcher())
+            self.run_worker(self.call_blink_worker())
+            
             
             if self.offline_ready():
                 # Start Deaddrop raw SAM session
@@ -1218,6 +1471,15 @@ class I2PChat(App):
         event.input.value = ""
 
 
+        if msg.strip() == "/accept":
+            await self.accept_pending_incoming()
+            return
+
+        if msg.strip() == "/decline":
+            await self.decline_pending_incoming()
+            return
+
+
         if msg.strip() == "/offline":
             if self.conn:
                 self.post("error", "Cannot enter offline mode during active live chat.")
@@ -1242,10 +1504,32 @@ class I2PChat(App):
             return
 
 
+        if msg.strip() == "/online":
+            if self.conn:
+                self.post("error", "Already in live chat mode.")
+                return
+
+            if not self.offline_mode:
+                self.post("error", "Already in normal standby mode.")
+                return
+
+            self.leave_offline_mode()
+            self.post("system", "Returned to normal standby mode.")
+            return
+
+
+
         if msg.startswith("/connect"):
             if self.conn:
                 self.post("error", "Already connected. Use /disconnect first.")
                 return
+            
+            if self.pending_incoming_conn:
+                self.post("error", "Incoming call is pending. Use /accept or /decline first.")
+                return
+            
+            
+            
             
             if not self.is_persistent_mode() and not self.publish_ready:
                 self.post("error", "Transient tunnels are still publishing. Wait a few seconds and try again.")
@@ -1407,6 +1691,9 @@ class I2PChat(App):
         
                 
         elif msg.strip() == "/disconnect":
+            if self.pending_incoming_conn and not self.conn:
+                self.post("error", "Incoming call is pending. Use /decline instead.")
+                return
             self.run_worker(self.disconnect_peer())
             
             
@@ -1536,7 +1823,7 @@ class I2PChat(App):
     async def accept_loop(self):
         while True:
             
-            if self.conn:
+            if self.conn or self.pending_incoming_conn:
                 await asyncio.sleep(1)
                 continue
             
@@ -1587,30 +1874,30 @@ class I2PChat(App):
                     else:
                         self.clear_tofu_runtime_status()
 
-                    self.post("success", f"Connection accepted from {peer_addr[:12]}...")
+                    #self.post("success", f"Connection accepted from {peer_addr[:12]}...")
                 except:
                     peer_addr = "Unknown"
 
-                # Handshake, send OUR identity back in return
-                if hasattr(self, 'my_pub_dest_b64'):
-                    writer.write(self.frame_message('S', self.my_pub_dest_b64))
-                    await writer.drain()
-                    
-                    # Send E2E key
-                    writer.write(self.frame_message('K', self.e2e.public_bytes()))
-                    await writer.drain()
+                if self.pending_incoming_conn:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except:
+                        pass
+                    continue
 
-
-                if self.offline_mode:
-                    self.leave_offline_mode()
-                    self.watch_peer_b32(self.peer_b32)
-                    self.post("system", "Leaving OFFLINE mode due to live incoming connection.")
-
-                self.conn = (reader, writer)
-                self.live_ready = False
+                self.pending_incoming_conn = (reader, writer)
+                self.pending_incoming_addr = self.current_peer_addr
+                self.pending_incoming_dest_b64 = self.current_peer_dest_b64
                 
-                # Start receiver
-                self.run_worker(self.receive_loop(self.conn))
+                self.pending_incoming_task = asyncio.create_task(
+                    self.pending_receive_loop(self.pending_incoming_conn)
+                )
+                
+                self.watch_peer_b32(self.peer_b32)
+
+                caller = self.pending_incoming_addr or "Unknown"
+                self.post("system", f"Incoming call from {caller[:12]}... Type /accept or /decline.")
             
             except Exception as e:
                 await asyncio.sleep(1)
@@ -1786,6 +2073,29 @@ class I2PChat(App):
             if "__SIGNAL__:" in body:
 
                 if "QUIT" in body:
+                    if source == "pending":
+                        caller = self.pending_incoming_addr or "Unknown"
+                        
+                        self.clear_pending_incoming()
+                        self.current_peer_addr = None
+                        self.current_peer_dest_b64 = None
+                        self.peer_b32 = "Waiting for incoming connections..."
+                        self.clear_tofu_runtime_status()
+
+                        if self.pending_incoming_task:
+                            self.pending_incoming_task.cancel()
+                            self.pending_incoming_task = None
+
+                        if writer is not None:
+                            try:
+                                writer.close()
+                                await writer.wait_closed()
+                            except:
+                                pass
+
+                        self.post("system", f"Incoming caller disconnected: {caller[:12]}...")
+                        return
+
                     self.post("system", "Peer requested disconnect.")
 
             else:
@@ -1834,6 +2144,11 @@ class I2PChat(App):
         elif msg_type == 'K':
             try:
                 self.e2e.receive_peer_key(payload)
+                
+                if source == "pending":
+                    return
+                
+                
                 self.live_ready = True
                 self.post("system", "Secure session established 🔐")
                 
@@ -2080,6 +2395,25 @@ class I2PChat(App):
         except:
             pass
         
+        if self.pending_incoming_task:
+            try:
+                self.pending_incoming_task.cancel()
+            except:
+                pass
+            self.pending_incoming_task = None
+        
+        
+        if self.pending_incoming_conn:
+            try:
+                _, writer = self.pending_incoming_conn
+                writer.close()
+                await writer.wait_closed()
+            except:
+                pass
+            self.clear_pending_incoming()
+
+        
+        
         if self.conn:
             try:
                 
@@ -2292,10 +2626,13 @@ class I2PChat(App):
         self.post("help", "Connection:")
         self.post("help", "  /connect <b32-address>   Connect to peer")
         self.post("help", "  /disconnect              Close connection")
+        self.post("help", "  /accept                  Accept incoming call")
+        self.post("help", "  /reject                  Reject incoming call")
 
         self.post("help", "Messaging:")
         self.post("help", "  Type text and press ENTER to send message")
         self.post("help", "  /offline                 Enter offline messaging mode (persistent locked peer only)")
+        self.post("help", "  /online                  Exit offline messaging mode") (persistent locked peer only)")
         
         self.post("help", "Identity:")
         self.post("help", "  /lock                    Lock persistent profile to current peer (not available in TRANSIENT mode)")
@@ -2315,6 +2652,7 @@ class I2PChat(App):
 
 
         self.post("help", "Utility:")
+        self.post("help", "  c                        Copy local b32 address to your clipboard")
         self.post("help", "  /help                    Show this help")
         self.post("help", "  /CTRL+q                  Exit program")
         
@@ -2322,9 +2660,7 @@ class I2PChat(App):
 
 
 
-# if __name__ == "__main__":
-#     app = I2PChat()
-#     app.run()
+
 
 if __name__ == "__main__":
     app = None
