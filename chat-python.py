@@ -2632,7 +2632,7 @@ class I2PChat(App):
         self.post("help", "Messaging:")
         self.post("help", "  Type text and press ENTER to send message")
         self.post("help", "  /offline                 Enter offline messaging mode (persistent locked peer only)")
-        self.post("help", "  /online                  Exit offline messaging mode" (persistent locked peer only)")
+        self.post("help", "  /online                  Exit offline messaging mode (persistent locked peer only)")
         
         self.post("help", "Identity:")
         self.post("help", "  /lock                    Lock persistent profile to current peer (not available in TRANSIENT mode)")
