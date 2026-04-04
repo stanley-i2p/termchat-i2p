@@ -5,6 +5,7 @@ import getpass
 
 import asyncio
 from textual.app import App, ComposeResult
+from textual import events
 from textual.widgets import Input, RichLog
 from textual.reactive import reactive
 from textual.widgets import Static
@@ -243,6 +244,11 @@ class I2PChat(App):
         
         self.pending_messages = {}
         
+        # Command history init
+        self.command_history = []
+        self.command_history_index = None
+        self.command_history_current_buffer = ""
+        
         self.e2e = E2E()
         
         
@@ -427,6 +433,51 @@ class I2PChat(App):
             addr = self.my_b32
             pyperclip.copy(addr)  # Use xclip automatically
             self.post("success", "Copied to system clipboard!")
+
+
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key not in ("up", "down"):
+            return
+
+        input_widget = self.query_one(Input)
+
+        if not input_widget.has_focus:
+            return
+
+        if not self.command_history:
+            return
+
+        if event.key == "up":
+            event.prevent_default()
+            event.stop()
+
+            if self.command_history_index is None:
+                self.command_history_current_buffer = input_widget.value
+                self.command_history_index = len(self.command_history) - 1
+            elif self.command_history_index > 0:
+                self.command_history_index -= 1
+
+            input_widget.value = self.command_history[self.command_history_index]
+            input_widget.cursor_position = len(input_widget.value)
+            return
+
+        if event.key == "down":
+            event.prevent_default()
+            event.stop()
+
+            if self.command_history_index is None:
+                return
+
+            if self.command_history_index < len(self.command_history) - 1:
+                self.command_history_index += 1
+                input_widget.value = self.command_history[self.command_history_index]
+            else:
+                self.command_history_index = None
+                input_widget.value = self.command_history_current_buffer
+
+            input_widget.cursor_position = len(input_widget.value)
+            return
 
 
      
@@ -1466,8 +1517,21 @@ class I2PChat(App):
         
 
     async def on_input_submitted(self, event: Input.Submitted):
-        msg = event.value.strip()
-        if not msg: return
+        # msg = event.value.strip()
+        # if not msg: return
+        # event.input.value = ""
+        
+        raw_msg = event.value
+        msg = raw_msg.strip()
+        if not msg:
+            return
+
+        if msg.startswith("/"):
+            if not self.command_history or self.command_history[-1] != msg:
+                self.command_history.append(msg)
+
+        self.command_history_index = None
+        self.command_history_current_buffer = ""
         event.input.value = ""
 
 
@@ -1659,15 +1723,24 @@ class I2PChat(App):
         
         
         elif msg.strip() == "/dd-list":
+            if not self.is_persistent_mode():
+                self.post("error", "Deaddrop commands are available only in PERSISTENT mode.")
+                return
             self.show_deaddrop_servers()
             return
 
         elif msg.startswith("/dd-add "):
+            if not self.is_persistent_mode():
+                self.post("error", "Deaddrop commands are available only in PERSISTENT mode.")
+                return
             server = msg[len("/dd-add "):].strip()
             self.add_deaddrop_server(server)
             return
 
         elif msg.startswith("/dd-del "):
+            if not self.is_persistent_mode():
+                self.post("error", "Deaddrop commands are available only in PERSISTENT mode.")
+                return
             arg = msg[len("/dd-del "):].strip()
             try:
                 idx = int(arg)
@@ -1677,6 +1750,9 @@ class I2PChat(App):
             return
 
         elif msg.strip() == "/dd-share":
+            if not self.is_persistent_mode():
+                self.post("error", "Deaddrop commands are available only in PERSISTENT mode.")
+                return
             if not self.conn:
                 self.post("error", "No active connection to share deaddrop servers.")
                 return
@@ -1745,7 +1821,7 @@ class I2PChat(App):
                         self.save_offline_state()
                         self.set_dd_status("put_ok")
                         self.post("me_offline", msg)
-                        self.post("system", f"[OFFLINE] queued and replicated via deaddrops key_index={send_index}")
+                        #self.post("system", f"[OFFLINE] queued and replicated via deaddrops key_index={send_index}")
                         queued = True
                         break
 
@@ -1769,7 +1845,7 @@ class I2PChat(App):
                 
         else:
             if self.is_persistent_mode() and not self.stored_peer:
-                self.post("error", "Offline messaging requires a locked peer in persistent mode.")
+                self.post("error", "Offline messaging requires a locked peer in PERSISTENT mode.")
             else:
                 self.post("error", "No active connection. Use /connect <address>")
                 
@@ -2126,17 +2202,33 @@ class I2PChat(App):
                                 pass
                         return
 
+#                     self.current_peer_addr = peer_addr
+#                     self.current_peer_dest_b64 = body
+#                     self.peer_b32 = peer_addr
+#                     
+#                     if self.stored_peer_dest_b64:
+#                         self.set_tofu_verified()
+#                     else:
+#                         self.clear_tofu_runtime_status()
+# 
+#                     fp = self.peer_dest_fingerprint(body)
+#                     self.post("info", f"Peer Identity: {peer_addr} (TOFU {fp})")
+
                     self.current_peer_addr = peer_addr
                     self.current_peer_dest_b64 = body
                     self.peer_b32 = peer_addr
                     
-                    if self.stored_peer_dest_b64:
+                    if self.is_persistent_mode() and self.stored_peer_dest_b64:
                         self.set_tofu_verified()
                     else:
                         self.clear_tofu_runtime_status()
 
                     fp = self.peer_dest_fingerprint(body)
-                    self.post("info", f"Peer Identity: {peer_addr} [dim](TOFU {fp})[/]")
+
+                    if self.is_persistent_mode():
+                        self.post("info", f"Peer Identity: {peer_addr} (TOFU {fp})")
+                    else:
+                        self.post("info", f"Peer Identity: {peer_addr}")
 
                 except:
                     pass
@@ -2577,7 +2669,7 @@ class I2PChat(App):
                                     source="drop"
                                 )
 
-                                self.post("system", f"[DROP] received type={msg_type} msg_id={msg_id} key_index={recv_index}")
+                                #self.post("system", f"[DROP] received type={msg_type} msg_id={msg_id} key_index={recv_index}")
 
                             except Exception as e:
                                 self.post("error", f"[DROP parse error] {e}")
@@ -2618,7 +2710,7 @@ class I2PChat(App):
         self.post("help", "Command line options:")
         
         self.post("help", "  Start with --reset <profile> to recreate a persistent profile from scratch")
-        self.post("help", "  Start with --delete <profile> to deletes profile completely")
+        self.post("help", "  Start with --delete <profile> to delete a profile completely")
         
         
         self.post("help", "Available commands:")
@@ -2631,8 +2723,8 @@ class I2PChat(App):
 
         self.post("help", "Messaging:")
         self.post("help", "  Type text and press ENTER to send message")
-        self.post("help", "  /offline                 Enter offline messaging mode (persistent locked peer only)")
-        self.post("help", "  /online                  Exit offline messaging mode (persistent locked peer only)")
+        self.post("help", "  /offline                 Enter offline messaging mode (PERSISTENT locked peer only)")
+        self.post("help", "  /online                  Exit offline messaging mode (PERSISTENT locked peer only)")
         
         self.post("help", "Identity:")
         self.post("help", "  /lock                    Lock persistent profile to current peer (not available in TRANSIENT mode)")
