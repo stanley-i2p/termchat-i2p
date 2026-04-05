@@ -140,13 +140,27 @@ FS_PASSPHRASE = getpass.getpass("Enter filesystem passphrase: ")
 
 vault_path = BASE_DIR + ".vault"
 
-if os.path.exists(vault_path):
-    if os.path.exists(BASE_DIR):
-        if not fs_verify_passphrase(BASE_DIR, FS_PASSPHRASE):
-            print("[FS ERROR] Wrong filesystem passphrase.")
-            sys.exit(1)
+try:
+    if os.path.exists(vault_path):
+        if os.path.exists(BASE_DIR):
+            if not fs_verify_passphrase(BASE_DIR, FS_PASSPHRASE):
+                print("[FS ERROR] Wrong filesystem passphrase.")
+                sys.exit(1)
+        else:
+            fs_decrypt(BASE_DIR, FS_PASSPHRASE)
+
+except Exception as e:
+    msg = str(e).lower()
+
+    if "wrong passphrase" in msg or "corrupted filesystem vault" in msg:
+        print("[FS ERROR] Wrong filesystem passphrase.")
     else:
-        fs_decrypt(BASE_DIR, FS_PASSPHRASE)
+        print(f"[FS ERROR] Failed to unlock filesystem storage: {e}")
+
+    sys.exit(1)
+    
+    
+    
 
 if DELETE_PROFILE:
     secure_delete_profile(PROFILE_NAME)
@@ -1472,7 +1486,8 @@ class I2PChat(App):
 
 
             self.network_status = "local_ok"
-            self.publish_ready = self.is_persistent_mode()
+            #self.publish_ready = self.is_persistent_mode()
+            self.publish_ready = False
             
             my_address = self.my_b32
             self.post("success", f"Online! My Address: {my_address}")
@@ -1595,8 +1610,12 @@ class I2PChat(App):
             
             
             
-            if not self.is_persistent_mode() and not self.publish_ready:
-                self.post("error", "Transient tunnels are still publishing. Wait a few seconds and try again.")
+            # if not self.is_persistent_mode() and not self.publish_ready:
+            #     self.post("error", "Transient tunnels are still publishing. Wait a few seconds and try again.")
+            #     return
+            
+            if not self.publish_ready:
+                self.post("error", "Tunnels are still publishing. Wait a few seconds and try again.")
                 return
             
             
