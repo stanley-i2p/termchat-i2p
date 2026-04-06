@@ -95,6 +95,30 @@ def secure_delete_profile(profile_name: str):
         print(f"[INFO] Profile does not exist: {profile_name}")
         
 
+
+def secure_wipe_all():
+    try:
+        if os.path.exists(BASE_DIR):
+            shutil.rmtree(BASE_DIR, ignore_errors=True)
+
+        vault_path = BASE_DIR + ".vault"
+        meta_path = BASE_DIR + ".vault.meta"
+
+        if os.path.exists(vault_path):
+            os.remove(vault_path)
+
+        if os.path.exists(meta_path):
+            os.remove(meta_path)
+
+        print("[OK] Removed all application data.")
+    except Exception as e:
+        print(f"[FS ERROR] Failed to wipe all application data: {e}")
+        sys.exit(1)
+
+
+
+        
+
 def ensure_deaddrop_bootstrap_file():
     if os.path.exists(DD_BOOTSTRAP_FILE):
         return
@@ -110,8 +134,16 @@ def ensure_deaddrop_bootstrap_file():
 
 RESET_PROFILE = False
 DELETE_PROFILE = False
+WIPE_ALL = False
 
-if len(sys.argv) > 2 and sys.argv[1] == "--reset":
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--wipe-all":
+    WIPE_ALL = True
+    PROFILE_NAME = "default"
+    
+    
+elif len(sys.argv) > 2 and sys.argv[1] == "--reset":
     RESET_PROFILE = True
     PROFILE_NAME = os.path.basename(sys.argv[2])
     
@@ -162,6 +194,11 @@ except Exception as e:
     
     
 
+if WIPE_ALL:
+    secure_wipe_all()
+    sys.exit(0)
+    
+    
 if DELETE_PROFILE:
     secure_delete_profile(PROFILE_NAME)
     sys.exit(0)
@@ -509,7 +546,8 @@ class I2PChat(App):
             "peer": "[bold cyan]Peer:[/] [white]{}[/]",
             "success": "[bold green]✔[/] [white]{}[/]",
             "disconnect": "[bold red]X[/] [white]{}[/]",
-            "help": "[dim]HELP:[/] [gray62]{}[/]"
+            "help": "[dim]HELP:[/] [gray62]{}[/]",
+            "help_bold": "[dim]HELP:[/] [gray62 bold]{}[/]"
         }
         
         
@@ -2726,43 +2764,82 @@ class I2PChat(App):
 
     def show_help(self):
 
-        self.post("help", "Command line options:")
+        self.post("help_bold", "Command line options:")
+        
+        self.post("help", "")
         
         self.post("help", "  Start with --reset <profile> to recreate a persistent profile from scratch")
         self.post("help", "  Start with --delete <profile> to delete a profile completely")
+        self.post("help", "  Start with --wipe-all to remove all app storage completely")
         
+        self.post("help", "")
         
-        self.post("help", "Available commands:")
+        self.post("help_bold", "Available commands:")
 
-        self.post("help", "Connection:")
+        self.post("help", "")
+
+        self.post("help_bold", "Connection:")
+        
+        self.post("help", "")
+        
         self.post("help", "  /connect <b32-address>   Connect to peer")
         self.post("help", "  /disconnect              Close connection")
         self.post("help", "  /accept                  Accept incoming call")
         self.post("help", "  /reject                  Reject incoming call")
 
-        self.post("help", "Messaging:")
+        self.post("help", "")
+
+        self.post("help_bold", "Messaging:")
+        
+        self.post("help", "")
+        
         self.post("help", "  Type text and press ENTER to send message")
         self.post("help", "  /offline                 Enter offline messaging mode (PERSISTENT locked peer only)")
         self.post("help", "  /online                  Exit offline messaging mode (PERSISTENT locked peer only)")
         
-        self.post("help", "Identity:")
+        self.post("help", "")
+        
+        self.post("help_bold", "Identity:")
+        
+        self.post("help", "")
+        
         self.post("help", "  /lock                    Lock persistent profile to current peer (not available in TRANSIENT mode)")
+        
+        self.post("help", "")
 
-        self.post("help", "Files:")
+        self.post("help_bold", "Files:")
+        
+        self.post("help", "")
+        
         self.post("help", "  /sendfile <path>         Send file")
+        
+        self.post("help", "")
 
-        self.post("help", "Images:")
+        self.post("help_bold", "Images:")
+        
+        self.post("help", "")
+        
         self.post("help", "  /img <path>              Send image (braille renderer)")
         self.post("help", "  /img-bw <path>           Send image (block renderer for QR / diagrams)")
+        
+        self.post("help", "")
+        
 
-        self.post("help", "Deaddrops:")
+        self.post("help_bold", "Deaddrops:")
+        
+        self.post("help", "")
+        
         self.post("help", "  /dd-list                 Show known deaddrop servers")
         self.post("help", "  /dd-add <b32>            Add deaddrop server")
         self.post("help", "  /dd-del <number>         Remove deaddrop server by list number")
         self.post("help", "  /dd-share                Share deaddrop server list with peer")
 
+        self.post("help", "")
 
-        self.post("help", "Utility:")
+        self.post("help_bold", "Utility:")
+        
+        self.post("help", "")
+        
         self.post("help", "  c                        Copy local b32 address to your clipboard")
         self.post("help", "  /help                    Show this help")
         self.post("help", "  /CTRL+q                  Exit program")
