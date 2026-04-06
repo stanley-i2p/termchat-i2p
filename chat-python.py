@@ -96,6 +96,17 @@ def secure_delete_profile(profile_name: str):
         
 
 
+
+def confirm_action(prompt: str) -> bool:
+    try:
+        ans = input(f"{prompt} [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return ans in ("y", "yes")
+
+        
+
+
 def secure_wipe_all():
     try:
         if os.path.exists(BASE_DIR):
@@ -195,16 +206,34 @@ except Exception as e:
     
 
 if WIPE_ALL:
+    if not confirm_action("Wipe ALL application data?"):
+        print("[INFO] Cancelled.")
+        sys.exit(0)
     secure_wipe_all()
     sys.exit(0)
     
     
+
+    
 if DELETE_PROFILE:
+    if not confirm_action(f"Delete profile '{PROFILE_NAME}'?"):
+        print("[INFO] Cancelled.")
+        sys.exit(0)
     secure_delete_profile(PROFILE_NAME)
     sys.exit(0)
+    
+
+
 
 if RESET_PROFILE and os.path.exists(PROFILE_DIR):
-    shutil.rmtree(PROFILE_DIR, ignore_errors=True)
+    if not confirm_action(f"Reset profile '{PROFILE_NAME}'?"):
+        print("[INFO] Cancelled.")
+        sys.exit(0)
+    
+    if os.path.exists(PROFILE_DIR):
+        shutil.rmtree(PROFILE_DIR, ignore_errors=True)
+
+
 
 secure_makedirs(PROFILE_DIR)
 secure_makedirs(IMAGE_DIR)
