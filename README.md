@@ -124,6 +124,59 @@ flowchart TD
     end
 ```
 
+## Security Architecture
+
+### Vibe coding is trending, but ...
+
+**Security design** must follow the **actual threat model** of the system, **not generic checklists**. In **specialized architectures**, developers sometimes apply **standard defensive patterns** mechanically — including patterns suggested by **automated tools** or **general-purpose AI assistants** — even when those patterns **do not match the real attack surface**. This can introduce **unnecessary complexity**, **misleading assumptions**, and code paths that **do not** materially **improve security**.
+
+## General overview of security architecture
+
+**Termchat-I2P** is designed around strong **compartmentalization**, **minimal metadata exposure**, and **per-peer isolation*.
+
+Each profile is **independent**. **Identities**, **peer bindings**, **offline state**, and **deaddrop state** are separated **per profile**, which greatly limits blast radius: compromise, confusion, or reset of one identity does not automatically affect any other identity or relationship.
+
+The application operates over **I2P** and assumes the normal case is that traffic is carried **inside the I2P network** rather than exposed to **ordinary network-path interception(!!!)**. In the intended deployment model, classic **man-in-the-middle** style attacks are **not considered practical or useful**. Even so, the *protocol* still uses **end-to-end encryption** and **TOFU-style** peer pinning as defense in depth.
+
+This extra protection is especially relevant in cases where the I2P router is not running on the same machine as the application, or where a hostile local environment could attempt to interfere with traffic between the app and the local I2P/SAM interface. In those edge cases, end-to-end encryption and TOFU provide an additional verification layer above transport alone.
+
+## Why MITM-Style Attacks Have Little Value Here
+
+The **architecture** is intentionally hostile to attacks that rely on persistent **interception**, **downgrade**, **replay**, or **identity substitution**.
+
+Profiles are **compartmentalized** and peer relationships are explicit. A **peer** is not a global account identity but a specific **isolated relationship**. If something looks wrong — for example, a **TOFU mismatch**, **unexpected identity change**, or **failed verification** — the **expected operational response** is not to continue under uncertainty, but to **terminate the session**, **discard that identity relationship**, and recreate it if necessary.
+
+That means the **attacker does not gain much by attempting sophisticated interception**. They are not attacking a large reusable global identity with long-lived trust across the whole system. At best, they can cause **disruption** or force **one isolated identity** to be **abandoned** and replaced. **The design turns many classes of active attack into denial-of-service with little strategic value(!!!)**.
+
+**Replay-style or differential protocol manipulation** is also of **limited usefulness** in this model. The protocol is **framed**, **stateful**, **compartmentalized**, and **tied to isolated peer contexts**. The result is that **attacks which might matter more in global-identity systems provide little leverage here**.
+
+## Practical Security Model
+
+The **most realistic risks** are not network MITM in the usual sense, but:
+
+* endpoint compromise - **ENDPOINT**
+* local malware or hostile software on the same machine - **ENDPOINT**
+* operational mistakes by users - **ENDPOINT/HUMAN**
+* misuse of trust decisions - **HUMAN**
+* implementation bugs - **MINE :)**
+
+In other words, the **system is primarily designed so that network-level active attacks are unattractive and low-value**, while **local compromise remains the more serious concern**, as it is for **any secure messaging system**.
+
+## Summary
+
+**Termchat-I2P** does not rely on a single mechanism for safety. Its security comes from the combination of:
+
+* I2P transport
+* end-to-end encryption
+* TOFU peer pinning
+* per-profile compartmentalization
+* per-peer isolation
+* minimal offline metadata
+* operational ability to discard and recreate identities cleanly
+
+Because of **that combination**, many attack classes that are **traditionally important** — including **downgrade**, **replay**, and **MITM-oriented interference** — are either **impractical** in the intended model or **reduced mostly to nuisance** and **disruption rather than meaningful compromise**.
+
+
 
 ## TermchatI2P: Децентрализованный защищенный мессенджер
 
