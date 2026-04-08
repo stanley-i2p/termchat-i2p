@@ -1,7 +1,7 @@
 import os
 from hashlib import sha256
 
-import oqs
+#import oqs
 
 from nacl.public import PrivateKey, PublicKey
 from nacl.bindings import crypto_scalarmult
@@ -32,9 +32,16 @@ class E2E:
         self.pq_kem = None
         self.pq_public_key = None
         self.pq_secret_key = None
+        self._oqs = None
 
         if self.pq_enabled:
-            self.pq_kem = oqs.KeyEncapsulation(self.pq_alg)
+            try:
+                import oqs
+            except Exception as e:
+                raise RuntimeError("PQ mode requested, but oqs/liboqs is not installed or not available") from e
+
+            self._oqs = oqs
+            self.pq_kem = self._oqs.KeyEncapsulation(self.pq_alg)
             self.pq_public_key = self.pq_kem.generate_keypair()
 
 

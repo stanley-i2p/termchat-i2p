@@ -338,7 +338,14 @@ class I2PChat(App):
         self.command_history_current_buffer = ""
         
         self.pq_enabled = PQ_ENABLED
-        self.e2e = E2E(pq_enabled=self.pq_enabled)
+        #self.e2e = E2E(pq_enabled=self.pq_enabled)
+        
+        # Better handling of ugly trace messages I hate soo much :)
+        try:
+            self.e2e = E2E(pq_enabled=self.pq_enabled)
+        except Exception as e:
+            print(f"[PQ ERROR] {e}")
+            sys.exit(1)
         
         
         
@@ -2911,7 +2918,7 @@ class I2PChat(App):
         self.post("help", "  /connect <b32-address>   Connect to peer")
         self.post("help", "  /disconnect              Close connection")
         self.post("help", "  /accept                  Accept incoming call")
-        self.post("help", "  /reject                  Reject incoming call")
+        self.post("help", "  /decline                 Decline incoming call")
 
         self.post("help", "")
 
