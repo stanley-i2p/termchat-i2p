@@ -1,21 +1,24 @@
-MIT License
+PROPRIETARY LICENSE AND TERMS OF USE
 
-Copyright (c) 2026 stanley-i2p
+Copyright (c) 2026 stanley-i2p. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. PERMISSION TO USE & FORK
+Permission is hereby granted to any person to download, install, and run this software for personal, evaluation, or security audit purposes. Users are permitted to fork this repository within the GitHub platform, provided that prominent attribution to the original project and author is maintained in all copies and downstream forks.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+2. PROHIBITION ON MODIFICATION & DERIVATIVES
+You may not modify, adapt, transform, or create derivative works of this software, its underlying models, or its specific algorithms without prior written consent from the author. Unauthorized distribution of modified versions is strictly prohibited.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+3. ARTIFICIAL INTELLIGENCE & MODELS
+While the use of this code for general machine learning training is permitted, the use of AI tools to generate new code that adapts, mimics, or re-implements the specific models and ideas contained herein is prohibited unless explicit permission is granted. Any such implementation requires prior contact and mandatory attribution.
+
+4. MANDATORY ATTRIBUTION & CONSENT
+If you wish to extend, modify, or build upon this work, you must contact the author first to request permission. If permission is granted, you must include a clear notice identifying the original work and author.
+
+5. DISCLAIMER OF WARRANTY ("AS IS")
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+6. LIMITATION OF LIABILITY
+UNDER NO CIRCUMSTANCES SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+6. CONTACT
+To request modification rights or for inquiries regarding derivative works, please contact: 268402168+stanley-i2p@users.noreply.github.com
