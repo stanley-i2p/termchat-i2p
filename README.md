@@ -752,3 +752,14 @@ Because keys rotate per message, old messages do not normally reappear unless cl
 ### Overall
 
 This architecture provides strong privacy, strong compartmentalization, and strong peer authenticity once TOFU is enforced, while keeping the offline layer minimal and metadata-poor.
+
+
+## License
+
+Copyright (c) 2026 stanley-i2p. All rights reserved.
+
+This project is licensed under a custom proprietary license. While you are free to download, use, and fork this repository for personal and evaluation purposes, you are **not permitted** to modify, adapt, or create derivative works without prior written consent from the author.
+
+For full terms and conditions, including specific rules regarding AI-generated code and mandatory attribution, please refer to the [LICENSE](./LICENSE) file.
+
+
