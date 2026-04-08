@@ -40,7 +40,9 @@ So the **group** exists only as:
 Let's assume that each member has N - 1 direct 1:1 relationships (as per our current max. security model) :)))
 
 **Total simultaneous connections:**
-$$ \frac{N(N-1)}{2} $$
+```math
+\frac{N(N-1)}{2}
+```
 
 
 ### Usability and Security
