@@ -25,9 +25,10 @@ As a result, the messenger aims to provide strong privacy, low metadata exposure
 - [**DONE** Testing] Additional work is being done for offline replication as well as for offline server lists exchange protocol (natual diffusion model).
 - After broader real-world testing and possible **security review / audit**, we are considering a future **rewrite in C++**.
 - [**DONE**] In the longer term, the Python version is also expected to **move away from `libi2p` entirely** in favor of a cleaner and more controlled implementation path.
-- [**DONE** Testing] TermChatI2P support **multiple instances (with different profiles) running under the same user account**. The application's file system encryption must account for this.
-- [**DONE** Testing] TermChatI2P supports **whole-filesystem encryption for its local storage**. On startup, the storage under .termchat-i2p is decrypted before the app begins normal operation; on shutdown, it is encrypted again so profiles, blobs, received files, and images remain unreadable while the app is closed. This protection is global for the entire app data directory, works the same way for both transient and persistent modes, and is **cross-platform because it does not depend on OS-specific disk-encryption features**.
-
+- [**DONE**] TermChatI2P supports **multiple instances (with different profiles) running under the same user account**. The application's file system encryption must account for this.
+- [**DONE**] TermChatI2P supports **whole-filesystem encryption for its local storage**. On startup, the storage under .termchat-i2p is decrypted before the app begins normal operation; on shutdown, it is encrypted again so profiles, blobs, received files, and images remain unreadable while the app is closed. This protection is global for the entire app data directory, works the same way for both transient and persistent modes, and is **cross-platform because it does not depend on OS-specific disk-encryption features**.
+- [**DONE**] TermChatI2P supports **Hybrid Post Quantum (PQ/HPQ)** encryption.
+See HybridPQ folder for furhter details and updates.
 
 ## Core Architecture
 
