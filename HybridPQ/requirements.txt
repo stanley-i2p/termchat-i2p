@@ -1,6 +1,0 @@
-textual
-textual-image
-rich
-pyperclip
-Pillow
-pynacl

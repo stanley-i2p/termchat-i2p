@@ -2,6 +2,8 @@ import asyncio
 import base64
 import hashlib
 
+DEBUG = False
+
 
 class SAMClient:
     def __init__(self, sam_host="127.0.0.1", sam_port=7656):
@@ -23,7 +25,8 @@ class SAMClient:
         await self.ctrl_writer.drain()
 
         resp = await self.ctrl_reader.readline()
-        print("[SAM HELLO]", resp.decode().strip())
+        if DEBUG:
+            print("[SAM HELLO]", resp.decode().strip())
         
         
     
@@ -45,7 +48,8 @@ class SAMClient:
 
         resp = await self.ctrl_reader.readline()
         resp_str = resp.decode().strip()
-        print("[SAM DEST GENERATE]", resp_str)
+        if DEBUG:
+            print("[SAM DEST GENERATE]", resp_str)
 
         parts = resp_str.split()
 
@@ -71,7 +75,8 @@ class SAMClient:
 
         resp = await self.ctrl_reader.readline()
         resp_str = resp.decode().strip()
-        print("[SAM LOOKUP]", resp_str)
+        if DEBUG:
+            print("[SAM LOOKUP]", resp_str)
 
         parts = resp_str.split()
 
@@ -121,7 +126,8 @@ class SAMClient:
         resp = await self.ctrl_reader.readline()
         resp_str = resp.decode().strip()
 
-        print("[SAM SESSION]", resp_str)
+        if DEBUG:
+            print("[SAM SESSION]", resp_str)
 
         if "RESULT=OK" not in resp_str:
             raise RuntimeError(f"SAM session failed: {resp_str}")
@@ -150,7 +156,9 @@ class SAMClient:
 
         cmd = f"STREAM CONNECT ID={self.session_id} DESTINATION={destination_b32}\n"
 
-        print("[SAM CONNECT]", cmd.strip())
+        if DEBUG:
+            print("[SAM CONNECT]", cmd.strip())
+        
 
         writer.write(cmd.encode())
         await writer.drain()
@@ -158,7 +166,10 @@ class SAMClient:
         resp = await reader.readline()
         resp_str = resp.decode().strip()
 
-        print("[SAM CONNECT RESP]", resp_str)
+        if DEBUG:
+            print("[SAM CONNECT RESP]", resp_str)
+            
+
 
         if "RESULT=OK" not in resp_str:
             writer.close()

@@ -1,6 +1,8 @@
 import os
 from hashlib import sha256
 
+#import oqs
+
 from nacl.public import PrivateKey, PublicKey
 from nacl.bindings import crypto_scalarmult
 from nacl.secret import SecretBox
@@ -9,14 +11,38 @@ from nacl.utils import random
 
 class E2E:
 
-    def __init__(self):
+    def __init__(self, pq_enabled: bool = False):
 
-        # identity keys
+        # Classical identity keys
         self.private_key = PrivateKey.generate()
         self.public_key = self.private_key.public_key
 
         self.peer_public = None
+
+        # Combined live session key
         self.session_key = None
+
+        # Hybrid state
+        self.pq_enabled = pq_enabled
+        self.classical_shared = None
+        self.pq_shared = None
+
+        # PQ KEM state
+        self.pq_alg = "ML-KEM-768"
+        self.pq_kem = None
+        self.pq_public_key = None
+        self.pq_secret_key = None
+        self._oqs = None
+
+        if self.pq_enabled:
+            try:
+                import oqs
+            except Exception as e:
+                raise RuntimeError("PQ mode requested, but oqs/liboqs is not installed or not available") from e
+
+            self._oqs = oqs
+            self.pq_kem = self._oqs.KeyEncapsulation(self.pq_alg)
+            self.pq_public_key = self.pq_kem.generate_keypair()
 
 
     
@@ -27,16 +53,64 @@ class E2E:
         return bytes(self.public_key)
 
 
+    def finalize_session_key_if_ready(self):
+        if self.classical_shared is None:
+            return
+
+        if self.pq_enabled:
+            if self.pq_shared is None:
+                return
+
+            material = b"|".join([
+                b"TERMCHAT_HYBRID_V1",
+                self.classical_shared,
+                self.pq_shared,
+            ])
+            self.session_key = sha256(material).digest()
+        else:
+            material = b"|".join([
+                b"TERMCHAT_CLASSICAL_V1",
+                self.classical_shared,
+            ])
+            self.session_key = sha256(material).digest()
+
+
+
+
     def receive_peer_key(self, data):
 
         self.peer_public = PublicKey(data)
 
-        shared = crypto_scalarmult(
+        self.classical_shared = crypto_scalarmult(
             self.private_key._private_key,
             self.peer_public._public_key
         )
 
-        self.session_key = sha256(shared).digest()
+        self.finalize_session_key_if_ready()
+        
+        
+        
+    def pq_public_bytes(self):
+        if not self.pq_enabled:
+            return None
+        return self.pq_public_key
+
+    def receive_peer_pq_public(self, peer_pq_public: bytes) -> bytes:
+        if not self.pq_enabled or not self.pq_kem:
+            raise RuntimeError("PQ is not enabled locally")
+
+        ciphertext, shared = self.pq_kem.encap_secret(peer_pq_public)
+        self.pq_shared = shared
+        self.finalize_session_key_if_ready()
+        return ciphertext
+
+    def receive_peer_pq_ciphertext(self, ciphertext: bytes):
+        if not self.pq_enabled or not self.pq_kem:
+            raise RuntimeError("PQ is not enabled locally")
+
+        self.pq_shared = self.pq_kem.decap_secret(ciphertext)
+        self.finalize_session_key_if_ready()
+        
 
 
     def ready(self):

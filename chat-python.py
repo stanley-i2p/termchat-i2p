@@ -7,6 +7,7 @@ import asyncio
 from textual.app import App, ComposeResult
 from textual import events
 from textual.widgets import Input, RichLog
+from textual.containers import Container
 from textual.reactive import reactive
 from textual.widgets import Static
 from datetime import datetime, timezone
@@ -146,24 +147,31 @@ def ensure_deaddrop_bootstrap_file():
 RESET_PROFILE = False
 DELETE_PROFILE = False
 WIPE_ALL = False
+PQ_ENABLED = False
 
 
 
-if len(sys.argv) > 1 and sys.argv[1] == "--wipe-all":
+raw_args = sys.argv[1:]
+
+if "--pq" in raw_args:
+    PQ_ENABLED = True
+    raw_args = [a for a in raw_args if a != "--pq"]
+
+if len(raw_args) > 0 and raw_args[0] == "--wipe-all":
     WIPE_ALL = True
     PROFILE_NAME = "default"
-    
-    
-elif len(sys.argv) > 2 and sys.argv[1] == "--reset":
+
+elif len(raw_args) > 1 and raw_args[0] == "--reset":
     RESET_PROFILE = True
-    PROFILE_NAME = os.path.basename(sys.argv[2])
-    
-elif len(sys.argv) > 2 and sys.argv[1] == "--delete":
+    PROFILE_NAME = os.path.basename(raw_args[1])
+
+elif len(raw_args) > 1 and raw_args[0] == "--delete":
     DELETE_PROFILE = True
-    PROFILE_NAME = os.path.basename(sys.argv[2])
-    
-elif len(sys.argv) > 1:
-    PROFILE_NAME = os.path.basename(sys.argv[1])
+    PROFILE_NAME = os.path.basename(raw_args[1])
+
+elif len(raw_args) > 0:
+    PROFILE_NAME = os.path.basename(raw_args[0])
+
 else:
     PROFILE_NAME = "default"
     
@@ -251,19 +259,47 @@ FS_INSTANCE_COUNT = fs_runtime_enter(BASE_DIR)
 class I2PChat(App):
     # This maps "q" or "ctrl+q" to the action "quit"
     BINDINGS = [("q", "quit", "Quit"), ("ctrl+q", "quit", "Quit"), ("c", "copy_my_addr", "Copy My B32")]
-    
+        
     CSS = """
-    RichLog { height: 1fr; border: solid white; background: $surface; } 
-    Input { dock: bottom; }
     #status_bar {
         dock: top;
-        height: 3; /* Increased height to fit the box border */
+        height: 3;
         margin: 0 0;
         content-align: center middle;
-        background: $surface; 
-        color: $text;              
+        background: $surface;
+        color: $text;
+    }
+
+    #bottom_bar {
+        dock: bottom;
+        height: 4;
+        layout: vertical;
+        background: $surface;
+    }
+
+    #command_bar {
+        height: 1;
+        margin: 0 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text;
+    }
+
+    #chat_input {
+        height: 3;
+    }
+    
+
+    RichLog {
+        height: 1fr;
+        border: solid white;
+        background: $surface;
     }
     """
+    
+    
+    
+    
 
     
     peer_b32 = reactive("Waiting for incoming connections...")
@@ -294,6 +330,7 @@ class I2PChat(App):
         
         self.tofu_verified = False
         self.tofu_mismatch = False
+        self.pq_active = False
         
         self.profile = PROFILE_NAME
     
@@ -329,7 +366,15 @@ class I2PChat(App):
         self.command_history_index = None
         self.command_history_current_buffer = ""
         
-        self.e2e = E2E()
+        self.pq_enabled = PQ_ENABLED
+        
+        
+        # Better handling of ugly trace messages I hate soo much :)
+        try:
+            self.e2e = E2E(pq_enabled=self.pq_enabled)
+        except Exception as e:
+            print(f"[PQ ERROR] {e}")
+            sys.exit(1)
         
         
         
@@ -370,15 +415,68 @@ class I2PChat(App):
 
 
     def compose(self) -> ComposeResult:
-        
-        yield Static(id="status_bar") 
+               
+        yield Static(id="status_bar")
         yield RichLog(id="chat_window", highlight=False, markup=True)
-        yield Input(placeholder="Type message and press Enter...")
+
+        with Container(id="bottom_bar"):
+            yield Input(placeholder="Type message and press Enter...", id="chat_input")
+            yield Static(id="command_bar")
+        
 
 
     def watch_network_status(self, _):
         # Refresh panel when network status changes
         self.watch_peer_b32(self.peer_b32)
+        
+        
+        
+    def get_command_hints(self) -> str:
+        hints = []
+
+        if self.pending_incoming_conn:
+            hints = ["/accept", "/decline", "/help"]
+
+        elif self.conn and not self.live_ready:
+            hints = ["/disconnect", "/help"]
+
+        elif self.conn and self.live_ready:
+            hints = ["/disconnect", "/sendfile", "/img", "/img-bw", "/help"]
+
+            if self.is_persistent_mode():
+                hints.extend(["/dd-list", "/dd-add", "/dd-del", "/dd-share"])
+
+            if self.is_persistent_mode() and not self.stored_peer:
+                hints.append("/lock")
+
+        elif self.offline_mode:
+            hints = ["/online", "send message", "/help"]
+
+            if self.is_persistent_mode():
+                hints.extend(["/dd-list", "/dd-add", "/dd-del"])
+
+        else:
+            hints = ["/connect", "/help"]
+
+            if self.offline_ready():
+                hints.insert(1, "/offline")
+
+            if self.is_persistent_mode():
+                hints.extend(["/dd-list", "/dd-add", "/dd-del"])
+
+        return "   ".join(hints)
+    
+    
+    
+    
+    def update_command_bar(self):
+        try:
+            hints = self.get_command_hints()
+            self.query_one("#command_bar").update(f"[dim]{hints}[/]")
+        except:
+            pass
+        
+        
 
     
     def watch_peer_b32(self, new_val: str) -> None:
@@ -432,18 +530,22 @@ class I2PChat(App):
         else:
             tofu_tag = ""
         
+        pq_tag = " [black on magenta] PQ [/]" if self.pq_active else ""
+        
         offline_tag = " [black on yellow] OFF [/]" if self.offline_mode else ""
         
         dd_label = self.get_dd_status_label()
         dd_tag = f" {dd_label}" if self.offline_mode and dd_label else ""
         
-        #call_tag = " [black on magenta] CALL [/]" if self.pending_incoming_conn else ""
+        
         if self.pending_incoming_conn:
             call_tag = " [black on cyan] INCOMING CALL [/]" if self.call_blink_on else " [black on grey62] CALL [/]"
         else:
             call_tag = ""
         
-        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{lock_tag}{tofu_tag}{offline_tag}{dd_tag}{call_tag}"
+        #left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{lock_tag}{tofu_tag}{offline_tag}{dd_tag}{call_tag}"
+        
+        left_content = f"[black on {tag_bg}] [bold]{mode_tag}[/] [/] [bold]{self.profile.upper()}[/]{lock_tag}{tofu_tag}{pq_tag}{offline_tag}{dd_tag}{call_tag}"
         
         transfer = self.get_file_transfer_status()
         #dd_label = self.get_dd_status_label()
@@ -503,6 +605,9 @@ class I2PChat(App):
             self.query_one("#status_bar").update(status_panel)
         except:
             pass
+        
+        
+        self.update_command_bar()
 
         
     
@@ -520,7 +625,8 @@ class I2PChat(App):
         if event.key not in ("up", "down"):
             return
 
-        input_widget = self.query_one(Input)
+        #input_widget = self.query_one(Input)
+        input_widget = self.query_one("#chat_input", Input)
 
         if not input_widget.has_focus:
             return
@@ -669,7 +775,7 @@ class I2PChat(App):
         if version != PROTOCOL_VERSION:
             raise ValueError("Unsupported protocol version")
         
-        if msg_type not in b"UDISFCEKPOXL":
+        if msg_type not in b"UDISFCEKPOXLQY":
             raise ValueError("Unknown frame type")
 
     
@@ -695,7 +801,7 @@ class I2PChat(App):
         if version != PROTOCOL_VERSION:
             raise ValueError("Unsupported protocol version")
 
-        if msg_type not in b"UDISFCEKPOXL":
+        if msg_type not in b"UDISFCEKPOXLQY":
             raise ValueError("Unknown frame type")
 
         if length < 0 or length > MAX_FRAME_SIZE:
@@ -740,6 +846,27 @@ class I2PChat(App):
         self.tofu_verified = False
         self.tofu_mismatch = False
         self.watch_peer_b32(self.peer_b32)
+        
+        
+        
+        
+    def mark_live_ready_if_needed(self):
+        if self.e2e.ready() and not self.live_ready:
+            self.live_ready = True
+            self.pq_active = self.pq_enabled
+            self.watch_peer_b32(self.peer_b32)
+            
+            self.update_command_bar()
+            
+            self.post("system", "Secure session established 🔐")
+
+            if self.offline_ready():
+                asyncio.create_task(self.send_offline_secret_if_needed())
+
+            if self.is_persistent_mode():
+                asyncio.create_task(self.send_deaddrop_server_list())
+        
+        
 
 
     def clear_pending_incoming(self):
@@ -816,6 +943,9 @@ class I2PChat(App):
                     self.current_peer_dest_b64 = None
                     self.peer_b32 = "Waiting for incoming connections..."
                     self.clear_tofu_runtime_status()
+                    self.pq_active = False
+                    
+                    self.update_command_bar()
                     
                     self.post("system", f"Incoming caller disconnected: {caller[:12]}...")
 
@@ -841,6 +971,9 @@ class I2PChat(App):
             self.current_peer_dest_b64 = None
             self.peer_b32 = "Waiting for incoming connections..."
             self.clear_tofu_runtime_status()
+            self.pq_active = False
+            
+            self.update_command_bar()
             
             self.post("error", "Incoming caller disconnected.")
             return
@@ -880,6 +1013,10 @@ class I2PChat(App):
 
             writer.write(self.frame_message('K', self.e2e.public_bytes()))
             await writer.drain()
+            
+            if self.pq_enabled:
+                writer.write(self.frame_message('Q', self.e2e.pq_public_bytes()))
+                await writer.drain()
 
         if self.offline_mode:
             self.leave_offline_mode()
@@ -888,6 +1025,9 @@ class I2PChat(App):
 
         self.conn = (reader, writer)
         self.live_ready = self.e2e.ready()
+        
+        self.watch_peer_b32(self.peer_b32)
+        self.update_command_bar()
 
         self.promoting_pending_incoming = False
 
@@ -912,6 +1052,9 @@ class I2PChat(App):
             self.current_peer_dest_b64 = None
             self.peer_b32 = "Waiting for incoming connections..."
             self.clear_tofu_runtime_status()
+            self.pq_active = False
+            
+            self.update_command_bar()
             
             self.post("system", "Incoming caller already disconnected.")
             return
@@ -938,6 +1081,9 @@ class I2PChat(App):
         self.current_peer_dest_b64 = None
         self.peer_b32 = "Waiting for incoming connections..."
         self.clear_tofu_runtime_status()
+        self.pq_active = False
+        
+        self.update_command_bar()
 
         try:
             writer.close()
@@ -1475,6 +1621,7 @@ class I2PChat(App):
         
         self.post("system", "Initializing SAM Session...")
         self.post("system", f"Initializing Profile: {self.profile}")
+        self.post("system", f"Post-quantum mode: {'ON' if self.pq_enabled else 'OFF'}")
         
         if RESET_PROFILE:
             self.post("system", f"Profile {self.profile} was reset before startup.")
@@ -1574,6 +1721,8 @@ class I2PChat(App):
             self.run_worker(self.tunnel_watcher())
             self.run_worker(self.call_blink_worker())
             
+            self.update_command_bar()
+            
             
             if self.offline_ready():
                 # Start Deaddrop raw SAM session
@@ -1646,6 +1795,7 @@ class I2PChat(App):
 
             self.offline_mode = True
             self.watch_peer_b32(self.peer_b32)
+            self.update_command_bar()
             self.post("system", "Entered OFFLINE mode.")
             return
 
@@ -1660,6 +1810,7 @@ class I2PChat(App):
                 return
 
             self.leave_offline_mode()
+            self.update_command_bar()
             self.post("system", "Returned to normal standby mode.")
             return
 
@@ -1958,6 +2109,10 @@ class I2PChat(App):
                 # Send E2E key
                 writer.write(self.frame_message('K', self.e2e.public_bytes()))
                 await writer.drain()
+                
+                if self.pq_enabled:
+                    writer.write(self.frame_message('Q', self.e2e.pq_public_bytes()))
+                    await writer.drain()
                         
                 
                 self.proven = True 
@@ -1967,6 +2122,10 @@ class I2PChat(App):
 
             self.conn = (reader, writer)
             self.live_ready = False
+            
+            self.watch_peer_b32(self.peer_b32)
+            self.update_command_bar()
+            
             self.post("success", "Handshake sent. Establishing tunnel...")
             self.run_worker(self.receive_loop(self.conn)) 
             
@@ -2105,11 +2264,14 @@ class I2PChat(App):
                 
                 self.conn = None
                 self.live_ready = False
+                self.pq_active = False
                 self.current_peer_dest_b64 = None
                 self.post("disconnect", "Peer disconnected.")
                 self.peer_b32 = "Waiting for incoming connections..."
                 self.clear_tofu_runtime_status()
                 self.post("system", "Waiting for incoming connections...")
+                
+                self.update_command_bar()
 
             try:
                 writer.close()
@@ -2288,17 +2450,7 @@ class I2PChat(App):
                                 pass
                         return
 
-#                     self.current_peer_addr = peer_addr
-#                     self.current_peer_dest_b64 = body
-#                     self.peer_b32 = peer_addr
-#                     
-#                     if self.stored_peer_dest_b64:
-#                         self.set_tofu_verified()
-#                     else:
-#                         self.clear_tofu_runtime_status()
-# 
-#                     fp = self.peer_dest_fingerprint(body)
-#                     self.post("info", f"Peer Identity: {peer_addr} (TOFU {fp})")
+
 
                     self.current_peer_addr = peer_addr
                     self.current_peer_dest_b64 = body
@@ -2323,11 +2475,19 @@ class I2PChat(App):
             try:
                 self.e2e.receive_peer_key(payload)
                 
+                if self.pq_enabled:
+                    return
+                
                 if source == "pending":
                     return
                 
                 
                 self.live_ready = True
+                self.pq_active = False
+                self.watch_peer_b32(self.peer_b32)
+                
+                self.update_command_bar()
+                
                 self.post("system", "Secure session established 🔐")
                 
                 if self.offline_ready():
@@ -2338,6 +2498,52 @@ class I2PChat(App):
                 
             except Exception as e:
                 self.post("error", f"E2E key error: {e}")
+                
+                
+                
+        elif msg_type == 'Q':
+            try:
+                if not self.pq_enabled:
+                    self.post("error", "Peer requires PQ, but this instance was started without --pq.")
+                    if writer is not None:
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except:
+                            pass
+                    return
+
+                ciphertext = self.e2e.receive_peer_pq_public(payload)
+
+                if writer is not None:
+                    writer.write(self.frame_message('Y', ciphertext))
+                    await writer.drain()
+
+                self.mark_live_ready_if_needed()
+
+            except Exception as e:
+                self.post("error", f"PQ public key handling failed: {e}")
+                
+
+
+        elif msg_type == 'Y':
+            try:
+                if not self.pq_enabled:
+                    self.post("error", "Unexpected PQ ciphertext while PQ is disabled.")
+                    if writer is not None:
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except:
+                            pass
+                    return
+
+                self.e2e.receive_peer_pq_ciphertext(payload)
+                self.mark_live_ready_if_needed()
+
+            except Exception as e:
+                self.post("error", f"PQ ciphertext handling failed: {e}")
+
                 
                 
         elif msg_type == 'X':
@@ -2543,13 +2749,16 @@ class I2PChat(App):
             reader, writer = self.conn
             
             self.reset_transfer_state()
-            self.watch_peer_b32(self.peer_b32)
             
             self.conn = None
             self.live_ready = False
+            self.pq_active = False
             self.current_peer_dest_b64 = None
             self.peer_b32 = "Waiting for incoming connections..."
             self.clear_tofu_runtime_status()
+            self.watch_peer_b32(self.peer_b32)
+            
+            self.update_command_bar()
             
             try:
                 
@@ -2814,7 +3023,7 @@ class I2PChat(App):
         self.post("help", "  /connect <b32-address>   Connect to peer")
         self.post("help", "  /disconnect              Close connection")
         self.post("help", "  /accept                  Accept incoming call")
-        self.post("help", "  /reject                  Reject incoming call")
+        self.post("help", "  /decline                 Decline incoming call")
 
         self.post("help", "")
 
