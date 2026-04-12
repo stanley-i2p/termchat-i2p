@@ -3006,6 +3006,7 @@ class I2PChat(App):
         
         self.post("help", "")
         
+        self.post("help", "  Start with --pq [<profile>] to enable HybridPQ encryption. Both peers must use this flag to establish a connection.")
         self.post("help", "  Start with --reset <profile> to recreate a persistent profile from scratch")
         self.post("help", "  Start with --delete <profile> to delete a profile completely")
         self.post("help", "  Start with --wipe-all to remove all app storage completely")
