@@ -1,6 +1,6 @@
-## TermChatI2P
+## Termchat-I2P
 
-TermChatI2P is a terminal-based private messenger designed for one-to-one communication over the I2P network.  
+**Termchat-I2P** is a terminal-based private messenger designed for one-to-one communication over the I2P network.
 It supports both **live encrypted chat** and **offline messaging**, while keeping the protocol compact and operationally simple.
 
 The application has two modes: **transient mode** for short-lived live sessions, and **persistent mode** for long-term trusted peers with saved identity and offline support.
@@ -17,6 +17,14 @@ The design emphasizes compartmentalization: live chat, offline delivery, persist
 
 As a result, the messenger aims to provide strong privacy, low metadata exposure, and practical offline capability without relying on heavy server-side logic.
 
+## DeadDrop Watcher
+
+**DeadDrop Watcher** is a small read-only companion tool for **Termchat-I2P** that monitors persistent locked profiles for waiting offline messages on deaddrop servers.
+Security-wise, it is a strong addition because it stays **separate** from **Termchat-I2P client** and can run by itself **without exposing live Termchat activity**.
+It **does not initiate chats**, **does not publish user interaction patterns** through the chat UI, and **does not interfere with message state**.
+Its network behavior is **limited to transient read-only checks over I2P**, using the same **compartmentalized per-profile model** as **Termchat-I2P** itself.
+This provides **offline-message awareness** while preserving the **isolation and low-exposure design philosophy** of the **Termchat-I2P** project in general.
+
 ## Project Status
 
 - This project is being developed in **multiple phases**, and a number of features and refinements are still planned for later stages.
@@ -25,9 +33,9 @@ As a result, the messenger aims to provide strong privacy, low metadata exposure
 - [**DONE** Testing] Additional work is being done for offline replication as well as for offline server lists exchange protocol (natual diffusion model).
 - After broader real-world testing and possible **security review / audit**, we are considering a future **rewrite in C++**.
 - [**DONE**] In the longer term, the Python version is also expected to **move away from `libi2p` entirely** in favor of a cleaner and more controlled implementation path.
-- [**DONE**] TermChatI2P supports **multiple instances (with different profiles) running under the same user account**. The application's file system encryption must account for this.
-- [**DONE**] TermChatI2P supports **whole-filesystem encryption for its local storage**. On startup, the storage under .termchat-i2p is decrypted before the app begins normal operation; on shutdown, it is encrypted again so profiles, blobs, received files, and images remain unreadable while the app is closed. This protection is global for the entire app data directory, works the same way for both transient and persistent modes, and is **cross-platform because it does not depend on OS-specific disk-encryption features**.
-- [**DONE**] TermChatI2P supports **Hybrid Post Quantum (PQ/HPQ)** encryption.
+- [**DONE**] Termchat-I2P supports **multiple instances (with different profiles) running under the same user account**. The application's file system encryption must account for this.
+- [**DONE**] Termchat-I2P supports **whole-filesystem encryption for its local storage**. On startup, the storage under .termchat-i2p is decrypted before the app begins normal operation; on shutdown, it is encrypted again so profiles, blobs, received files, and images remain unreadable while the app is closed. This protection is global for the entire app data directory, works the same way for both transient and persistent modes, and is **cross-platform because it does not depend on OS-specific disk-encryption features**.
+- [**DONE**] Termchat-I2P supports **Hybrid Post Quantum (PQ/HPQ)** encryption.
 See HybridPQ folder for furhter details and updates.
 - [**DONE**] DeadDrop Watcher
 
@@ -188,6 +196,7 @@ TermchatI2P — это консольный (TUI) мессенджер, рабо
 ![TermchatI2P](chat3.png)
 ![TermchatI2P](chat4.png)
 ![TermchatI2P](chat2.png)
+![ddwatcher](ddwatcher.png)
 
 ## Quick start
 
