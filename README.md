@@ -29,6 +29,7 @@ As a result, the messenger aims to provide strong privacy, low metadata exposure
 - [**DONE**] TermChatI2P supports **whole-filesystem encryption for its local storage**. On startup, the storage under .termchat-i2p is decrypted before the app begins normal operation; on shutdown, it is encrypted again so profiles, blobs, received files, and images remain unreadable while the app is closed. This protection is global for the entire app data directory, works the same way for both transient and persistent modes, and is **cross-platform because it does not depend on OS-specific disk-encryption features**.
 - [**DONE**] TermChatI2P supports **Hybrid Post Quantum (PQ/HPQ)** encryption.
 See HybridPQ folder for furhter details and updates.
+- [**DONE**] DeadDrop Watcher
 
 ## Core Architecture
 
@@ -254,12 +255,12 @@ NOTE: Next Phase of development will remove i2plib dependencies completely.
 
 Start the application with:
 ```bash
-python chat.py [profile_name]
+python termchat-i2p.py [profile_name]
 ```
 Examples:
 ```bash
-python chat.py
-python chat.py alice
+python termchat-i2p.py
+python termchat-i2p.py alice
 ```
 
 #### Transient Mode
@@ -277,8 +278,8 @@ In this mode:
 If a profile name is provided, the messenger starts in **Persistent mode**.
 
 Example:
-```basg
-python chat.py alice
+```bash
+python termchat-i2p.py alice
 ```
 In this mode:
 
@@ -291,7 +292,7 @@ In this mode:
 
 To completely recreate a persistent profile from scratch, use:
 ```bash
-python chat.py --reset alice
+python termchat-i2p.py --reset alice
 ```
 This removes the **old profile** state for alice and starts again with a **fresh identity and clean local state**.
 
@@ -446,7 +447,7 @@ bubbles) в терминальном интерфейсе.
 ## 📝 Инструкция по использованию
 
 *   Если **имя_профиля** не указано, приложение запустится в **Transient** (временном) режиме — ваш адрес будет меняться при каждом перезапуске.
-*   Если указать имя (например, `python chat.py alice`), создастся файл `alice.dat`, который сохранит ваш постоянный адрес I2P.
+*   Если указать имя (например, `python termchat-i2p.py alice`), создастся файл `alice.dat`, который сохранит ваш постоянный адрес I2P.
 
 ### 🛠 Управление в приложении
 
