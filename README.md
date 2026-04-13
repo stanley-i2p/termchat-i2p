@@ -270,7 +270,7 @@ python termchat-i2p.py
 python termchat-i2p.py alice
 ```
 
-## Building single-file executables
+### Building single-file executables
 
 UV provides a very straightforward way to build with PyInstaller:
 
@@ -289,7 +289,7 @@ pyinstaller --onefile --console --hidden-import=_cffi_backend ddwatcher.py
 ```
 
 
-#### Transient Mode
+### Transient Mode
 
 If no profile name is provided, the messenger starts in **Transient mode**.
 
