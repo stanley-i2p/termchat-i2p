@@ -192,6 +192,7 @@ Because of **that combination**, many attack classes that are **traditionally im
 
 TermchatI2P — это консольный (TUI) мессенджер, работающий через анонимную сеть **I2P (Invisible Internet Project)**. Проект ориентирован на максимальную приватность, исключая центральные сервера и метаданные.
 
+![TermchatI2P](TermchatI2PMac.png)
 ![TermchatI2P](chat5.png)
 ![TermchatI2P](chat3.png)
 ![TermchatI2P](chat4.png)
