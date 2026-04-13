@@ -1,3 +1,6 @@
+APP_NAME = "DeadDrop Watcher"
+APP_VERSION = "1.0.0-rc1"
+
 import os
 import sys
 import time
@@ -25,6 +28,8 @@ WINDOW_CAP = 256
 RUN_TOKEN = int(time.time())
 FS_PASSPHRASE = None
 FS_INSTANCE_COUNT = 0
+FS_RUNTIME_ENTERED = False
+FS_DECRYPTED_BY_WATCHER = False
 SHUTDOWN_EVENT = asyncio.Event()
 MAIN_TASK = None
 
@@ -175,11 +180,12 @@ console = Console()
 
 
 def prepare_filesystem():
-    global FS_PASSPHRASE, FS_INSTANCE_COUNT
+    global FS_PASSPHRASE, FS_INSTANCE_COUNT, FS_RUNTIME_ENTERED, FS_DECRYPTED_BY_WATCHER
 
     vault_path = BASE_DIR + ".vault"
     
-    console.print("[cyan][WATCHER][/]: Starting deaddrop watcher")
+    console.print(f"[cyan][WATCHER][/]: Starting {APP_NAME} {APP_VERSION}")
+    
     console.print(f"[cyan][WATCHER][/]: Base directory: {BASE_DIR}")
 
     if os.path.exists(vault_path):
@@ -195,6 +201,7 @@ def prepare_filesystem():
             else:
                 console.print("[cyan][WATCHER][/]: Decrypting filesystem vault")
                 fs_decrypt(BASE_DIR, FS_PASSPHRASE)
+                FS_DECRYPTED_BY_WATCHER = True
                 console.print("[green][WATCHER][/]: Filesystem decrypted")
                 
         except Exception as e:
@@ -206,30 +213,37 @@ def prepare_filesystem():
             sys.exit(1)
 
     FS_INSTANCE_COUNT = fs_runtime_enter(BASE_DIR)
+    FS_RUNTIME_ENTERED = True
     console.print(f"[cyan][WATCHER][/]: Runtime instances active: {FS_INSTANCE_COUNT}")
 
 
 def finalize_filesystem():
     
-    global FS_INSTANCE_COUNT
+    global FS_INSTANCE_COUNT, FS_RUNTIME_ENTERED, FS_DECRYPTED_BY_WATCHER
     
-    console.print("[cyan][WATCHER][/]: Shutting down deaddrop watcher")
+    console.print(f"[cyan][WATCHER][/]: Shutting down {APP_NAME}")
+    
 
     try:
-        remaining = fs_runtime_leave(BASE_DIR)
-        FS_INSTANCE_COUNT = remaining
-        console.print(f"[cyan][WATCHER][/]: Runtime instances remaining: {remaining}")
-        
+        if FS_RUNTIME_ENTERED:
+            remaining = fs_runtime_leave(BASE_DIR)
+            FS_INSTANCE_COUNT = remaining
+            console.print(f"[cyan][WATCHER][/]: Runtime instances remaining: {remaining}")
+        else:
+            remaining = 0
     except Exception:
         remaining = None
+        
+        
 
     try:
-        if remaining == 0 and FS_PASSPHRASE and os.path.exists(BASE_DIR):
+        if remaining is not None and remaining > 0:
+            console.print("[cyan][WATCHER][/]: Leaving filesystem plaintext for other running instance(s)")
+        elif remaining == 0 and FS_PASSPHRASE and os.path.exists(BASE_DIR):
             console.print("[cyan][WATCHER][/]: Last instance exited, re-encrypting filesystem")
             fs_encrypt(BASE_DIR, FS_PASSPHRASE)
             console.print("[green][WATCHER][/]: Filesystem encrypted")
-        elif remaining is not None and remaining > 0:
-            console.print("[cyan][WATCHER][/]: Leaving filesystem plaintext for other running instance(s)")
+            
             
     except Exception as e:
         console.print(f"[red][FS ERROR] Failed to re-encrypt filesystem storage: {e}[/]")
@@ -259,7 +273,8 @@ def install_signal_handlers():
 
 
 def print_help():
-    console.print("[bold]DeadDrop Watcher[/]")
+    
+    console.print(f"[bold]{APP_NAME}[/] {APP_VERSION}")
     console.print("")
     console.print("Usage:")
     console.print("  python ddwatcher.py [--once] [--interval <seconds>] [--help]")
@@ -730,22 +745,22 @@ async def main():
     MAIN_TASK = asyncio.current_task()
     
     once, interval = parse_args()
-    
-    prepare_filesystem()
-    install_signal_handlers()
-
-    if not os.path.exists(BASE_DIR):
-        console.print("[red]Filesystem is not unlocked or base directory does not exist.[/]")
-        sys.exit(1)
-
-    
-
-    profiles = load_profiles()
-    console.print(f"[cyan][WATCHER][/]: Loaded {len(profiles)} locked persistent profile(s)")
-    clients = await build_clients(profiles)
-    console.print(f"[cyan][WATCHER][/]: Started {len(clients)} watcher GET session(s)")
+    clients = {}
 
     try:
+        
+        install_signal_handlers()
+        prepare_filesystem()
+
+        if not os.path.exists(BASE_DIR):
+            console.print("[red]Filesystem is not unlocked or base directory does not exist.[/]")
+            sys.exit(1)
+
+        profiles = load_profiles()
+        console.print(f"[cyan][WATCHER][/]: Loaded {len(profiles)} locked persistent profile(s)")
+        clients = await build_clients(profiles)
+        console.print(f"[cyan][WATCHER][/]: Started {len(clients)} watcher GET session(s)")
+
         if once:
             with Live(render_placeholder_table(profiles, 1, None, None), console=console, refresh_per_second=8, transient=False) as live:
                 table = await run_once(1, profiles, clients)

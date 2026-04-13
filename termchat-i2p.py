@@ -1,3 +1,6 @@
+APP_NAME = "Termchat-I2P"
+APP_VERSION = "1.0.0-rc1"
+
 import sys, os
 import shutil
 import stat
@@ -144,6 +147,47 @@ def ensure_deaddrop_bootstrap_file():
     secure_write_text(DD_BOOTSTRAP_FILE, content)
 
 
+
+def print_help():
+    print(f"{APP_NAME} {APP_VERSION}")
+    print("")
+    print("Usage:")
+    print("  termchat-i2p [profile_name] [--pq]")
+    print("  termchat-i2p --help")
+    print("  termchat-i2p --wipe-all")
+    print("  termchat-i2p --reset <profile_name>")
+    print("  termchat-i2p --delete <profile_name>")
+    print("")
+    print("Modes:")
+    print("  no profile name      Start in TRANSIENT mode")
+    print("  profile_name         Start/Use a PERSISTENT profile")
+    print("")
+    print("Options:")
+    print("  --pq                Enable post-quantum hybrid mode")
+    print("  --help              Show this help and exit")
+    print("  --wipe-all          Remove all application data")
+    print("  --reset <profile>   Reset one persistent profile")
+    print("  --delete <profile>  Delete one persistent profile")
+    print("")
+    print("Notes:")
+    print("  'default' is a reserved internal transient profile name.")
+    print("  Do not pass 'default' explicitly as a profile name.")
+
+
+
+def validate_profile_name_or_exit(name: str):
+    if name == "default":
+        print("[ERROR] 'default' is a reserved internal TRANSIENT profile name.")
+        print("Start without a profile name for TRANSIENT mode.")
+        sys.exit(1)
+
+    if name.startswith("-"):
+        print(f"[ERROR] Unknown option: {name}")
+        print("Use --help to see available options.")
+        sys.exit(1)
+
+
+
 RESET_PROFILE = False
 DELETE_PROFILE = False
 WIPE_ALL = False
@@ -152,6 +196,10 @@ PQ_ENABLED = False
 
 
 raw_args = sys.argv[1:]
+
+if "--help" in raw_args:
+    print_help()
+    sys.exit(0)
 
 if "--pq" in raw_args:
     PQ_ENABLED = True
@@ -164,13 +212,16 @@ if len(raw_args) > 0 and raw_args[0] == "--wipe-all":
 elif len(raw_args) > 1 and raw_args[0] == "--reset":
     RESET_PROFILE = True
     PROFILE_NAME = os.path.basename(raw_args[1])
+    validate_profile_name_or_exit(PROFILE_NAME)
 
 elif len(raw_args) > 1 and raw_args[0] == "--delete":
     DELETE_PROFILE = True
     PROFILE_NAME = os.path.basename(raw_args[1])
+    validate_profile_name_or_exit(PROFILE_NAME)
 
 elif len(raw_args) > 0:
     PROFILE_NAME = os.path.basename(raw_args[0])
+    validate_profile_name_or_exit(PROFILE_NAME)
 
 else:
     PROFILE_NAME = "default"
@@ -1618,7 +1669,7 @@ class I2PChat(App):
         self.peer_b32 = "Initializing SAM Session..."
         
         
-        
+        self.post("system", f"{APP_NAME} {APP_VERSION}")
         self.post("system", "Initializing SAM Session...")
         self.post("system", f"Initializing Profile: {self.profile}")
         self.post("system", f"Post-quantum mode: {'ON' if self.pq_enabled else 'OFF'}")

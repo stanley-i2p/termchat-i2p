@@ -15,6 +15,9 @@ FS_MEM_LIMIT = pwhash.argon2id.MEMLIMIT_MODERATE
 FS_RUNTIME_DIRNAME = ".fs_runtime"
 FS_RUNTIME_STATE_NAME = "state.json"
 
+FS_DIR_MODE = 0o700
+FS_FILE_MODE = 0o600
+
 
 def fs_vault_path(base_dir: str) -> str:
     return base_dir + ".vault"
@@ -66,6 +69,32 @@ def fs_extract_tar_bytes(data: bytes, target_parent: str):
     buf = io.BytesIO(data)
     with tarfile.open(fileobj=buf, mode="r:gz") as tar:
         tar.extractall(path=target_parent)
+        
+        
+def fs_secure_permissions(base_dir: str):
+    if not os.path.exists(base_dir):
+        return
+
+    for root, dirs, files in os.walk(base_dir):
+        try:
+            os.chmod(root, FS_DIR_MODE)
+        except:
+            pass
+
+        for d in dirs:
+            path = os.path.join(root, d)
+            try:
+                os.chmod(path, FS_DIR_MODE)
+            except:
+                pass
+
+        for f in files:
+            path = os.path.join(root, f)
+            try:
+                os.chmod(path, FS_FILE_MODE)
+            except:
+                pass
+        
 
 
 def fs_remove_plain(base_dir: str):
@@ -129,6 +158,7 @@ def fs_decrypt(base_dir: str, passphrase: str):
 
     parent = os.path.dirname(base_dir)
     fs_extract_tar_bytes(plain, parent)
+    fs_secure_permissions(base_dir)
     
 
 def fs_verify_passphrase(base_dir: str, passphrase: str) -> bool:
