@@ -254,10 +254,8 @@ source i2p_env/bin/activate
 
 Install everything in one step with:
 ```bash
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 ```
-NOTE: Updated version of **i2plib** is provided. DO NOT use legacy **libi2p** versions.
-NOTE: Next Phase of development will remove i2plib dependencies completely.
 
 
 ## Running the Messenger
@@ -271,6 +269,25 @@ Examples:
 python termchat-i2p.py
 python termchat-i2p.py alice
 ```
+
+## Building single-file executables
+
+UV provides a very straightforward way to build with PyInstaller:
+
+* Linux
+```bash
+uv pip install pyinstaller
+pyinstaller --onefile --hidden-import=_cffi_backend termchat-i2p.py
+pyinstaller --onefile --hidden-import=_cffi_backend ddwatcher.py
+```
+
+* MacOS
+```bash
+uv pip install pyinstaller
+pyinstaller --onefile --console --hidden-import=_cffi_backend termchat-i2p.py
+pyinstaller --onefile --console --hidden-import=_cffi_backend ddwatcher.py
+```
+
 
 #### Transient Mode
 
