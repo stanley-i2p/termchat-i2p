@@ -187,6 +187,10 @@ def prepare_filesystem():
     console.print(f"[cyan][WATCHER][/]: Starting {APP_NAME} {APP_VERSION}")
     
     console.print(f"[cyan][WATCHER][/]: Base directory: {BASE_DIR}")
+    
+    if not os.path.exists(BASE_DIR) and not os.path.exists(vault_path):
+        console.print("[yellow][WATCHER][/]: No plaintext filesystem and no vault found. Nothing to watch.")
+        sys.exit(0)
 
     if os.path.exists(vault_path):
         console.print("[cyan][WATCHER][/]: Encrypted filesystem vault detected")
@@ -211,6 +215,14 @@ def prepare_filesystem():
             else:
                 console.print(f"[red][FS ERROR] Failed to unlock filesystem storage: {e}[/]")
             sys.exit(1)
+            
+            
+    if os.path.exists(BASE_DIR):
+        try:
+            os.chmod(BASE_DIR, 0o700)
+        except:
+            pass
+        
 
     FS_INSTANCE_COUNT = fs_runtime_enter(BASE_DIR)
     FS_RUNTIME_ENTERED = True

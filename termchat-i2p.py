@@ -5,6 +5,7 @@ import sys, os
 import shutil
 import stat
 import getpass
+import tarfile
 
 import asyncio
 from textual.app import App, ComposeResult
@@ -90,6 +91,45 @@ def secure_append_text(path: str, text: str):
         pass
 
 
+
+def secure_write_text_atomic(path: str, text: str):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, mode=DIR_MODE, exist_ok=True)
+        try:
+            os.chmod(parent, DIR_MODE)
+        except:
+            pass
+
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(dir=parent if parent else None)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+
+        try:
+            os.chmod(tmp_path, FILE_MODE)
+        except:
+            pass
+
+        os.replace(tmp_path, path)
+
+        try:
+            os.chmod(path, FILE_MODE)
+        except:
+            pass
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+
+
+
+
 def secure_delete_profile(profile_name: str):
     profile_dir = os.path.join(BASE_DIR, "profiles", os.path.basename(profile_name))
     if os.path.exists(profile_dir):
@@ -118,6 +158,7 @@ def secure_wipe_all():
 
         vault_path = BASE_DIR + ".vault"
         meta_path = BASE_DIR + ".vault.meta"
+        vault_lock_path = BASE_DIR + ".vault.lock"
 
         if os.path.exists(vault_path):
             os.remove(vault_path)
@@ -125,11 +166,83 @@ def secure_wipe_all():
         if os.path.exists(meta_path):
             os.remove(meta_path)
 
+        if os.path.exists(vault_lock_path):
+            os.remove(vault_lock_path)
+
         print("[OK] Removed all application data.")
     except Exception as e:
         print(f"[FS ERROR] Failed to wipe all application data: {e}")
         sys.exit(1)
 
+
+
+def export_encrypted_vault(export_path: str):
+    vault_path = BASE_DIR + ".vault"
+    meta_path = BASE_DIR + ".vault.meta"
+
+    if os.path.exists(BASE_DIR):
+        print("[FS ERROR] Cannot export while plaintext filesystem is present.")
+        print("Close all instances and make sure the filesystem is encrypted first.")
+        sys.exit(1)
+
+    if not os.path.exists(vault_path) or not os.path.exists(meta_path):
+        print("[FS ERROR] Encrypted vault files not found.")
+        sys.exit(1)
+
+    export_path = os.path.abspath(export_path)
+
+    try:
+        parent = os.path.dirname(export_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        with tarfile.open(export_path, "w:gz") as tar:
+            tar.add(vault_path, arcname=os.path.basename(vault_path))
+            tar.add(meta_path, arcname=os.path.basename(meta_path))
+
+        print(f"[OK] Exported encrypted vault to: {export_path}")
+    except Exception as e:
+        print(f"[FS ERROR] Failed to export encrypted vault: {e}")
+        sys.exit(1)
+
+
+def import_encrypted_vault(import_path: str):
+    vault_path = BASE_DIR + ".vault"
+    meta_path = BASE_DIR + ".vault.meta"
+
+    import_path = os.path.abspath(import_path)
+
+    if not os.path.exists(import_path):
+        print(f"[FS ERROR] Import file not found: {import_path}")
+        sys.exit(1)
+
+    if os.path.exists(BASE_DIR):
+        print("[FS ERROR] Plaintext filesystem already exists.")
+        print("Remove or encrypt existing filesystem before import.")
+        sys.exit(1)
+
+    if os.path.exists(vault_path) or os.path.exists(meta_path):
+        print("[FS ERROR] Existing encrypted vault already exists.")
+        print("Use --wipe-all first if you really want to replace it.")
+        sys.exit(1)
+
+    try:
+        with tarfile.open(import_path, "r:gz") as tar:
+            names = set(tar.getnames())
+
+            expected_vault = os.path.basename(vault_path)
+            expected_meta = os.path.basename(meta_path)
+
+            if expected_vault not in names or expected_meta not in names:
+                print("[FS ERROR] Import archive does not contain required vault files.")
+                sys.exit(1)
+
+            tar.extractall(path=os.path.dirname(BASE_DIR))
+
+        print(f"[OK] Imported encrypted vault from: {import_path}")
+    except Exception as e:
+        print(f"[FS ERROR] Failed to import encrypted vault: {e}")
+        sys.exit(1)
 
 
         
@@ -144,7 +257,7 @@ def ensure_deaddrop_bootstrap_file():
         "xxbgj3dlw7fvwz3emqnvyzxrdj3vqd3fcdw6rutmvzoxidyhp7bq.b32.i2p\n"
     )
 
-    secure_write_text(DD_BOOTSTRAP_FILE, content)
+    secure_write_text_atomic(DD_BOOTSTRAP_FILE, content)
 
 
 
@@ -157,6 +270,8 @@ def print_help():
     print("  termchat-i2p --wipe-all")
     print("  termchat-i2p --reset <profile_name>")
     print("  termchat-i2p --delete <profile_name>")
+    print("  termchat-i2p --export <file>")
+    print("  termchat-i2p --import <file>")
     print("")
     print("Modes:")
     print("  no profile name      Start in TRANSIENT mode")
@@ -168,6 +283,8 @@ def print_help():
     print("  --wipe-all          Remove all application data")
     print("  --reset <profile>   Reset one persistent profile")
     print("  --delete <profile>  Delete one persistent profile")
+    print("  --export <file>     Export encrypted vault+meta to a single archive")
+    print("  --import <file>     Import encrypted vault+meta from an archive")
     print("")
     print("Notes:")
     print("  'default' is a reserved internal transient profile name.")
@@ -191,7 +308,11 @@ def validate_profile_name_or_exit(name: str):
 RESET_PROFILE = False
 DELETE_PROFILE = False
 WIPE_ALL = False
+EXPORT_VAULT = False
+IMPORT_VAULT = False
 PQ_ENABLED = False
+EXPORT_PATH = None
+IMPORT_PATH = None
 
 
 
@@ -219,6 +340,16 @@ elif len(raw_args) > 1 and raw_args[0] == "--delete":
     PROFILE_NAME = os.path.basename(raw_args[1])
     validate_profile_name_or_exit(PROFILE_NAME)
 
+elif len(raw_args) > 1 and raw_args[0] == "--export":
+    EXPORT_VAULT = True
+    EXPORT_PATH = raw_args[1]
+    PROFILE_NAME = "default"
+
+elif len(raw_args) > 1 and raw_args[0] == "--import":
+    IMPORT_VAULT = True
+    IMPORT_PATH = raw_args[1]
+    PROFILE_NAME = "default"
+
 elif len(raw_args) > 0:
     PROFILE_NAME = os.path.basename(raw_args[0])
     validate_profile_name_or_exit(PROFILE_NAME)
@@ -236,6 +367,16 @@ BLOB_DIR = os.path.join(BASE_DIR, "blobs")
 DD_BOOTSTRAP_FILE = os.path.join(BASE_DIR, "deaddrop_servers.bootstrap.txt")
 
 
+
+
+if EXPORT_VAULT:
+    export_encrypted_vault(EXPORT_PATH)
+    sys.exit(0)
+
+if IMPORT_VAULT:
+    import_encrypted_vault(IMPORT_PATH)
+    sys.exit(0)
+    
 
 
 FS_PASSPHRASE = getpass.getpass("Enter filesystem passphrase: ")
@@ -293,7 +434,7 @@ if RESET_PROFILE and os.path.exists(PROFILE_DIR):
         shutil.rmtree(PROFILE_DIR, ignore_errors=True)
 
 
-
+secure_makedirs(PROFILE_DIR)
 secure_makedirs(PROFILE_DIR)
 secure_makedirs(IMAGE_DIR)
 secure_makedirs(FILE_DIR)
@@ -1382,7 +1523,7 @@ class I2PChat(App):
             content += f"drop_window={self.drop_window}\n"
             content += "consumed_drop_recv=" + ",".join(str(x) for x in sorted(self.consumed_drop_recv)) + "\n"
 
-            secure_write_text(path, content)
+            secure_write_text_atomic(path, content)
 
         except Exception as e:
             self.post("error", f"Failed to save offline state: {e}")
@@ -1554,7 +1695,8 @@ class I2PChat(App):
             path = self.deaddrop_servers_path()
             
             content = "".join(s + "\n" for s in self.deaddrop_servers)
-            secure_write_text(path, content)
+            
+            secure_write_text_atomic(path, content)
             
         except Exception as e:
             self.post("error", f"Failed to save deaddrop servers: {e}")
@@ -1722,7 +1864,7 @@ class I2PChat(App):
                     
                     secure_write_text(key_file, my_dest_b64 + "\n")
 
-                    self.post("success", f"Identity saved to [cyan]{key_file}[/]")
+                    self.post("success", f"Identity saved to {key_file}")
                     
             self.my_dest_b64 = my_dest_b64
             
@@ -1931,10 +2073,17 @@ class I2PChat(App):
                         self.post("error", "Peer full destination not yet known for TOFU pinning.")
                         return
 
-                    secure_append_text(
-                        key_file,
-                        self.current_peer_addr + "\n" + self.current_peer_dest_b64 + "\n"
-                    )
+
+                    with open(key_file, "r", encoding="utf-8") as f:
+                        lines = [line.rstrip("\n") for line in f.readlines()]
+
+                    if not lines:
+                        raise RuntimeError("Identity file is empty")
+
+                    content = lines[0] + "\n" + self.current_peer_addr + "\n" + self.current_peer_dest_b64 + "\n"
+                    secure_write_text_atomic(key_file, content)
+                    
+                    
 
                     self.stored_peer = self.current_peer_addr
                     self.stored_peer_dest_b64 = self.current_peer_dest_b64
@@ -1953,8 +2102,8 @@ class I2PChat(App):
                     #await self.ensure_offline_runtime_started()
 
                     fp = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
-                    self.post("success", f"Profile [bold yellow]{self.profile}[/] is now locked to this peer.")
-                    self.post("system", f"TOFU peer pin saved: [cyan]{fp}[/]")
+                    self.post("success", f"Profile {self.profile} is now locked to this peer.")
+                    self.post("system", f"TOFU peer pin saved: {fp}")
                 except Exception as e:
                     self.post("error", f"Failed to save: {e}")
             else:

@@ -4,6 +4,8 @@ import os
 import shutil
 import tarfile
 import getpass
+import tempfile
+import fcntl
 
 from nacl import pwhash, secret, utils, exceptions
 
@@ -14,6 +16,8 @@ FS_MEM_LIMIT = pwhash.argon2id.MEMLIMIT_MODERATE
 
 FS_RUNTIME_DIRNAME = ".fs_runtime"
 FS_RUNTIME_STATE_NAME = "state.json"
+FS_RUNTIME_LOCK_NAME = "lock"
+FS_VAULT_LOCK_SUFFIX = ".vault.lock"
 
 FS_DIR_MODE = 0o700
 FS_FILE_MODE = 0o600
@@ -34,6 +38,14 @@ def fs_runtime_state_path(base_dir: str) -> str:
     return os.path.join(fs_runtime_dir(base_dir), FS_RUNTIME_STATE_NAME)
 
 
+def fs_runtime_lock_path(base_dir: str) -> str:
+    return os.path.join(fs_runtime_dir(base_dir), FS_RUNTIME_LOCK_NAME)
+
+
+def fs_vault_lock_path(base_dir: str) -> str:
+    return base_dir + FS_VAULT_LOCK_SUFFIX
+
+
 def fs_is_encrypted(base_dir: str) -> bool:
     return os.path.exists(fs_vault_path(base_dir)) and not os.path.exists(base_dir)
 
@@ -49,13 +61,75 @@ def fs_derive_key(passphrase: str, salt: bytes) -> bytes:
 
 
 def fs_write_meta(meta_path: str, meta: dict):
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f)
+    fs_atomic_write_text(meta_path, json.dumps(meta))
 
 
 def fs_read_meta(meta_path: str) -> dict:
     with open(meta_path, "r", encoding="utf-8") as f:
         return json.load(f)
+    
+    
+class fs_file_lock:
+    def __init__(self, path: str):
+        self.path = path
+        self.fd = None
+
+    def __enter__(self):
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, mode=FS_DIR_MODE, exist_ok=True)
+            try:
+                os.chmod(parent, FS_DIR_MODE)
+            except:
+                pass
+
+        self.fd = open(self.path, "a+")
+        fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.fd:
+                fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            if self.fd:
+                self.fd.close()
+
+
+def fs_atomic_write_text(path: str, text: str):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, mode=FS_DIR_MODE, exist_ok=True)
+        try:
+            os.chmod(parent, FS_DIR_MODE)
+        except:
+            pass
+
+    fd, tmp_path = tempfile.mkstemp(dir=parent if parent else None)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+
+        try:
+            os.chmod(tmp_path, FS_FILE_MODE)
+        except:
+            pass
+
+        os.replace(tmp_path, path)
+
+        try:
+            os.chmod(path, FS_FILE_MODE)
+        except:
+            pass
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+
 
 
 def fs_build_tar_bytes(base_dir: str) -> bytes:
@@ -103,62 +177,73 @@ def fs_remove_plain(base_dir: str):
 
 
 def fs_encrypt(base_dir: str, passphrase: str):
-    if not os.path.exists(base_dir):
-        raise RuntimeError(f"Base dir does not exist: {base_dir}")
+    with fs_file_lock(fs_vault_lock_path(base_dir)):
+        if not os.path.exists(base_dir):
+            raise RuntimeError(f"Base dir does not exist: {base_dir}")
 
-    vault_path = fs_vault_path(base_dir)
-    meta_path = fs_meta_path(base_dir)
+        vault_path = fs_vault_path(base_dir)
+        meta_path = fs_meta_path(base_dir)
 
-    salt = utils.random(pwhash.argon2id.SALTBYTES)
-    key = fs_derive_key(passphrase, salt)
-    box = secret.SecretBox(key)
+        salt = utils.random(pwhash.argon2id.SALTBYTES)
+        key = fs_derive_key(passphrase, salt)
+        box = secret.SecretBox(key)
 
-    tar_bytes = fs_build_tar_bytes(base_dir)
-    nonce = utils.random(secret.SecretBox.NONCE_SIZE)
-    enc = box.encrypt(tar_bytes, nonce)
+        tar_bytes = fs_build_tar_bytes(base_dir)
+        nonce = utils.random(secret.SecretBox.NONCE_SIZE)
+        enc = box.encrypt(tar_bytes, nonce)
 
-    with open(vault_path, "wb") as f:
-        f.write(enc)
+        with open(vault_path, "wb") as f:
+            f.write(enc)
+            f.flush()
+            os.fsync(f.fileno())
 
-    meta = {
-        "version": FS_VAULT_VERSION,
-        "kdf": "argon2id",
-        "salt_hex": salt.hex(),
-    }
-    fs_write_meta(meta_path, meta)
+        try:
+            os.chmod(vault_path, FS_FILE_MODE)
+        except:
+            pass
 
-    fs_remove_plain(base_dir)
+        meta = {
+            "version": FS_VAULT_VERSION,
+            "kdf": "argon2id",
+            "salt_hex": salt.hex(),
+        }
+        fs_write_meta(meta_path, meta)
+
+        fs_remove_plain(base_dir)
+        
+        
 
 
 def fs_decrypt(base_dir: str, passphrase: str):
-    vault_path = fs_vault_path(base_dir)
-    meta_path = fs_meta_path(base_dir)
+    with fs_file_lock(fs_vault_lock_path(base_dir)):
+        vault_path = fs_vault_path(base_dir)
+        meta_path = fs_meta_path(base_dir)
 
-    if not os.path.exists(vault_path):
-        return
+        if not os.path.exists(vault_path):
+            return
 
-    if not os.path.exists(meta_path):
-        raise RuntimeError("Filesystem vault metadata file is missing")
+        if not os.path.exists(meta_path):
+            raise RuntimeError("Filesystem vault metadata file is missing")
 
-    meta = fs_read_meta(meta_path)
-    if meta.get("version") != FS_VAULT_VERSION:
-        raise RuntimeError(f"Unsupported filesystem vault version: {meta.get('version')}")
+        meta = fs_read_meta(meta_path)
+        if meta.get("version") != FS_VAULT_VERSION:
+            raise RuntimeError(f"Unsupported filesystem vault version: {meta.get('version')}")
 
-    salt = bytes.fromhex(meta["salt_hex"])
-    key = fs_derive_key(passphrase, salt)
-    box = secret.SecretBox(key)
+        salt = bytes.fromhex(meta["salt_hex"])
+        key = fs_derive_key(passphrase, salt)
+        box = secret.SecretBox(key)
 
-    with open(vault_path, "rb") as f:
-        enc = f.read()
+        with open(vault_path, "rb") as f:
+            enc = f.read()
 
-    try:
-        plain = box.decrypt(enc)
-    except exceptions.CryptoError:
-        raise RuntimeError("Wrong passphrase or corrupted filesystem vault")
+        try:
+            plain = box.decrypt(enc)
+        except exceptions.CryptoError:
+            raise RuntimeError("Wrong passphrase or corrupted filesystem vault")
 
-    parent = os.path.dirname(base_dir)
-    fs_extract_tar_bytes(plain, parent)
-    fs_secure_permissions(base_dir)
+        parent = os.path.dirname(base_dir)
+        fs_extract_tar_bytes(plain, parent)
+        fs_secure_permissions(base_dir)
     
 
 def fs_verify_passphrase(base_dir: str, passphrase: str) -> bool:
@@ -222,28 +307,34 @@ def fs_load_runtime_state(base_dir: str) -> dict:
 
 def fs_save_runtime_state(base_dir: str, state: dict):
     runtime_dir = fs_runtime_dir(base_dir)
-    os.makedirs(runtime_dir, exist_ok=True)
+    os.makedirs(runtime_dir, mode=FS_DIR_MODE, exist_ok=True)
+
+    try:
+        os.chmod(runtime_dir, FS_DIR_MODE)
+    except:
+        pass
 
     path = fs_runtime_state_path(base_dir)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f)
+    fs_atomic_write_text(path, json.dumps(state))
 
 
 def fs_runtime_enter(base_dir: str) -> int:
-    state = fs_load_runtime_state(base_dir)
-    state["instances"] = int(state.get("instances", 0)) + 1
-    fs_save_runtime_state(base_dir, state)
-    return state["instances"]
+    with fs_file_lock(fs_runtime_lock_path(base_dir)):
+        state = fs_load_runtime_state(base_dir)
+        state["instances"] = int(state.get("instances", 0)) + 1
+        fs_save_runtime_state(base_dir, state)
+        return state["instances"]
 
 
 def fs_runtime_leave(base_dir: str) -> int:
-    state = fs_load_runtime_state(base_dir)
-    current = int(state.get("instances", 0))
+    with fs_file_lock(fs_runtime_lock_path(base_dir)):
+        state = fs_load_runtime_state(base_dir)
+        current = int(state.get("instances", 0))
 
-    if current > 0:
-        current -= 1
+        if current > 0:
+            current -= 1
 
-    state["instances"] = current
-    fs_save_runtime_state(base_dir, state)
-    return current
+        state["instances"] = current
+        fs_save_runtime_state(base_dir, state)
+        return current
 
