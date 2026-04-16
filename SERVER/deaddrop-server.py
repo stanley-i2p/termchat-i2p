@@ -20,7 +20,11 @@ STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 # PLEASE: for Production try to use 1.
 # Having multiple instances of deaddrop-server on 1 physical server will
 # NOT increase fault tolerance of overall offline ecosystem.
-# Numbers > 1 are usefull when debugging deaddrop replication feature!!!
+#
+# Numbers greater than 1 are useful when debugging the deaddrop replication feature.!!!
+#
+# Since adding the anti flood PoW system, debugging with more than 1 instance is no
+# longer advisable
 NUM_DROPS = 1
 
 SAM_HOST = "127.0.0.1"
@@ -49,6 +53,9 @@ MAX_ACTIVE_CLIENTS_PER_DROP = 32
 PUT_RATE_WINDOW_SECONDS = 60
 MAX_PUTS_PER_WINDOW_PER_DROP = 500
 
+# PUT PoW
+POW_PREFIX = b"POWv1"
+POW_ZERO_BITS = 20
 
 
 
@@ -115,6 +122,40 @@ async def allow_put(drop_name: str) -> bool:
 
         times.append(now)
         return True
+
+
+
+
+def pow_material(key: str, size: int, blob: bytes, pow_counter: int) -> bytes:
+    return b"|".join([
+        POW_PREFIX,
+        key.encode(),
+        str(size).encode(),
+        blob,
+        str(pow_counter).encode(),
+    ])
+
+
+def pow_ok(digest: bytes) -> bool:
+    zero_bytes = POW_ZERO_BITS // 8
+    rem_bits = POW_ZERO_BITS % 8
+
+    if digest[:zero_bytes] != b"\x00" * zero_bytes:
+        return False
+
+    if rem_bits == 0:
+        return True
+
+    next_byte = digest[zero_bytes]
+    mask = 0xFF << (8 - rem_bits)
+    return (next_byte & mask) == 0
+
+
+def verify_put_pow(key: str, size: int, blob: bytes, pow_counter: int) -> bool:
+    material = pow_material(key, size, blob, pow_counter)
+    digest = hashlib.sha256(material).digest()
+    return pow_ok(digest)
+
 
 
 
@@ -189,7 +230,7 @@ async def handle_client(drop_name, reader, writer):
         
         # PUT CMD
         
-        if cmd == "PUT" and len(parts) >= 3:
+        if cmd == "PUT" and len(parts) >= 4:
 
             key = parts[1]
 
@@ -207,6 +248,20 @@ async def handle_client(drop_name, reader, writer):
                 print(f"[{drop_name}] PUT invalid size")
                 return
 
+            try:
+                pow_counter = int(parts[3])
+            except ValueError:
+                writer.write(b"ERR\n")
+                await asyncio.wait_for(writer.drain(), timeout=CLIENT_WRITE_TIMEOUT)
+                print(f"[{drop_name}] PUT key={key} size={size} result=REJECT_POW_COUNTER")
+                return
+
+            if pow_counter < 0:
+                writer.write(b"ERR\n")
+                await asyncio.wait_for(writer.drain(), timeout=CLIENT_WRITE_TIMEOUT)
+                print(f"[{drop_name}] PUT key={key} size={size} result=REJECT_POW_COUNTER")
+                return
+
             if size < 0 or size > MAX_BLOB_SIZE:
                 writer.write(b"ERR\n")
                 await asyncio.wait_for(writer.drain(), timeout=CLIENT_WRITE_TIMEOUT)
@@ -220,7 +275,12 @@ async def handle_client(drop_name, reader, writer):
                 return
 
             data = await asyncio.wait_for(reader.readexactly(size), timeout=CLIENT_READ_TIMEOUT)
-            
+
+            if not verify_put_pow(key, size, data, pow_counter):
+                writer.write(b"ERR\n")
+                await asyncio.wait_for(writer.drain(), timeout=CLIENT_WRITE_TIMEOUT)
+                print(f"[{drop_name}] PUT key={key} size={size} result=REJECT_POW")
+                return
 
             path = blob_path(drop_name, key)
 

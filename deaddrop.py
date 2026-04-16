@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 
 
 
@@ -23,6 +24,10 @@ class DeadDropClient:
         
         self.connect_timeout = 8.0
         self.io_timeout = 8.0
+        
+        # PoW settings (PUT only)!
+        self.pow_prefix = b"POWv1"
+        self.pow_zero_bits = 20
 
     
     # Init Session
@@ -115,15 +120,58 @@ class DeadDropClient:
 
 
 
+
+    def _pow_material(self, key: str, size: int, blob: bytes, pow_counter: int) -> bytes:
+        return b"|".join([
+            self.pow_prefix,
+            key.encode(),
+            str(size).encode(),
+            blob,
+            str(pow_counter).encode(),
+        ])
+
+    def _pow_ok(self, digest: bytes) -> bool:
+        zero_bytes = self.pow_zero_bits // 8
+        rem_bits = self.pow_zero_bits % 8
+
+        if digest[:zero_bytes] != b"\x00" * zero_bytes:
+            return False
+
+        if rem_bits == 0:
+            return True
+
+        next_byte = digest[zero_bytes]
+        mask = 0xFF << (8 - rem_bits)
+        return (next_byte & mask) == 0
+
+    def _find_pow_counter(self, key: str, blob: bytes) -> int:
+        size = len(blob)
+        pow_counter = 0
+
+        while True:
+            material = self._pow_material(key, size, blob, pow_counter)
+            digest = hashlib.sha256(material).digest()
+
+            if self._pow_ok(digest):
+                return pow_counter
+
+            pow_counter += 1
+
+
+
+
     async def _put_one(self, drop: str, key: str, blob: bytes):
         try:
             print("[DD] CONNECTING TO:", drop)
             print("[DD] SESSION:", self.put_session_id)
             print("[DD] KEY:", key)
 
+            size = len(blob)
+            pow_counter = self._find_pow_counter(key, blob)
+
             reader, writer = await self._connect(drop, mode="put")
 
-            writer.write(f"PUT {key} {len(blob)}\n".encode())
+            writer.write(f"PUT {key} {size} {pow_counter}\n".encode())
             writer.write(blob)
             await asyncio.wait_for(writer.drain(), timeout=self.io_timeout)
 
