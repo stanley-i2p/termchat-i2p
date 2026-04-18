@@ -160,14 +160,13 @@ class DeadDropClient:
 
 
 
-    async def _put_one(self, drop: str, key: str, blob: bytes):
+    async def _put_one(self, drop: str, key: str, blob: bytes, pow_counter: int):
         try:
             print("[DD] CONNECTING TO:", drop)
             print("[DD] SESSION:", self.put_session_id)
             print("[DD] KEY:", key)
 
             size = len(blob)
-            pow_counter = self._find_pow_counter(key, blob)
 
             reader, writer = await self._connect(drop, mode="put")
 
@@ -202,8 +201,10 @@ class DeadDropClient:
     async def put(self, key: str, blob: bytes):
         print("[DD] PUT CALLED")
 
+        pow_counter = self._find_pow_counter(key, blob)
+
         tasks = [
-            asyncio.create_task(self._put_one(drop, key, blob))
+            asyncio.create_task(self._put_one(drop, key, blob, pow_counter))
             for drop in self.drops
         ]
 

@@ -1,5 +1,5 @@
 APP_NAME = "Termchat-I2P"
-APP_VERSION = "1.0.0-rc1"
+APP_VERSION = "1.0.0-rc2"
 
 import sys, os
 import shutil
@@ -51,7 +51,7 @@ MAX_FILENAME = 128
 
 Image.MAX_IMAGE_PIXELS = 20_000_000
 
-
+MAX_ACTIVE_DEADDROP_REPLICAS = 3 # Offline replication const
 
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".termchat-i2p")
 BASE_DIR = os.path.abspath(BASE_DIR)
@@ -1655,6 +1655,12 @@ class I2PChat(App):
         return os.path.join(PROFILE_DIR, "deaddrop_servers.txt")
     
     
+    
+    def apply_deaddrop_replica_policy(self):
+        active = list(self.deaddrop_servers[:MAX_ACTIVE_DEADDROP_REPLICAS])
+        self.deaddrop.drops = active
+    
+    
 
     def load_deaddrop_servers(self):
         if not self.is_persistent_mode():
@@ -1681,8 +1687,12 @@ class I2PChat(App):
 
             if merged:
                 self.deaddrop_servers = merged
-                self.deaddrop.drops = list(self.deaddrop_servers)
-                self.post("system", f"Loaded {len(self.deaddrop_servers)} deaddrop servers.")
+                self.apply_deaddrop_replica_policy()
+                self.post(
+                    "system",
+                    f"Loaded {len(self.deaddrop_servers)} deaddrop servers "
+                    f"(active replicas: {len(self.deaddrop.drops)})."
+                )
         except Exception as e:
             self.post("error", f"Failed to load deaddrop servers: {e}")
 
@@ -1716,7 +1726,7 @@ class I2PChat(App):
                 changed = True
 
         if changed:
-            self.deaddrop.drops = list(self.deaddrop_servers)
+            self.apply_deaddrop_replica_policy()
             self.save_deaddrop_servers()
 
         return changed
@@ -1726,7 +1736,7 @@ class I2PChat(App):
         if server in self.deaddrop_servers:
             self.deaddrop_servers.remove(server)
             self.deaddrop_servers.insert(0, server)
-            self.deaddrop.drops = list(self.deaddrop_servers)
+            self.apply_deaddrop_replica_policy()
             self.save_deaddrop_servers()
 
 
