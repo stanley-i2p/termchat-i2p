@@ -1,8 +1,13 @@
+APP_NAME = "DeadDrop"
+APP_VERSION = "1.0.0-rc2"
+
+
 import asyncio
 import os
 import hashlib
 import signal
 import time
+import tempfile
 
 shutdown_event = asyncio.Event()
 
@@ -81,6 +86,33 @@ def blob_path(drop_name: str, key: str):
     sub = os.path.join(drop_storage_dir(drop_name), h[:2])
     os.makedirs(sub, exist_ok=True)
     return os.path.join(sub, h)
+
+
+
+
+def atomic_write_blob(path: str, data: bytes):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(dir=parent if parent else None)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_path, path)
+
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
 
 
 
@@ -288,11 +320,13 @@ async def handle_client(drop_name, reader, writer):
                 writer.write(b"EXISTS\n")
                 print(f"[{drop_name}] PUT key={key} size={size} result=EXISTS")
             else:
-                with open(path, "wb") as f:
-                    f.write(data)
-
-                writer.write(b"OK\n")
-                print(f"[{drop_name}] PUT key={key} size={size} result=OK")
+                try:
+                    atomic_write_blob(path, data)
+                    writer.write(b"OK\n")
+                    print(f"[{drop_name}] PUT key={key} size={size} result=OK")
+                except FileExistsError:
+                    writer.write(b"EXISTS\n")
+                    print(f"[{drop_name}] PUT key={key} size={size} result=EXISTS")
 
         
         # GET CMD

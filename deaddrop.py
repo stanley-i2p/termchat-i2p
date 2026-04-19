@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import time
 
 
 
@@ -28,6 +29,9 @@ class DeadDropClient:
         # PoW settings (PUT only)!
         self.pow_prefix = b"POWv1"
         self.pow_zero_bits = 20
+        
+        # Callback for server profiling
+        self.stats_callback = None
 
     
     # Init Session
@@ -160,7 +164,21 @@ class DeadDropClient:
 
 
 
+    def _report_stat(self, op: str, drop: str, ok: bool, latency_ms: float, detail: str):
+        if self.stats_callback is None:
+            return
+
+        try:
+            self.stats_callback(op, drop, ok, latency_ms, detail)
+        except Exception:
+            pass
+
+
+
+
     async def _put_one(self, drop: str, key: str, blob: bytes, pow_counter: int):
+        started = time.monotonic()
+
         try:
             print("[DD] CONNECTING TO:", drop)
             print("[DD] SESSION:", self.put_session_id)
@@ -181,17 +199,24 @@ class DeadDropClient:
             writer.close()
             await writer.wait_closed()
 
+            latency_ms = (time.monotonic() - started) * 1000.0
+
             if resp_str == "OK":
+                self._report_stat("put", drop, True, latency_ms, "OK")
                 return (drop, "OK")
             elif resp_str == "EXISTS":
                 print(f"[DD PUT] key already exists on {drop}: {key}")
+                self._report_stat("put", drop, True, latency_ms, "EXISTS")
                 return (drop, "EXISTS")
             else:
                 print(f"[DD PUT] unexpected response from {drop} for key {key}: {resp_str}")
+                self._report_stat("put", drop, False, latency_ms, resp_str or "FAIL")
                 return (drop, "FAIL")
 
         except Exception as e:
+            latency_ms = (time.monotonic() - started) * 1000.0
             print(f"[DROP PUT FAIL] {drop}: {e}")
+            self._report_stat("put", drop, False, latency_ms, type(e).__name__)
             return (drop, "FAIL")
 
 
@@ -224,6 +249,8 @@ class DeadDropClient:
  
  
     async def _get_one(self, drop: str, key: str):
+        started = time.monotonic()
+
         try:
             print("[DD GET] CONNECTING TO:", drop)
             
@@ -234,7 +261,8 @@ class DeadDropClient:
             await asyncio.wait_for(writer.drain(), timeout=self.io_timeout)
 
             header = await asyncio.wait_for(reader.readline(), timeout=self.io_timeout)
-            print("[DD GET HEADER]", header.decode().strip())
+            resp_str = header.decode().strip()
+            print("[DD GET HEADER]", resp_str)
 
             data = None
 
@@ -245,10 +273,21 @@ class DeadDropClient:
             writer.close()
             await writer.wait_closed()
 
+            latency_ms = (time.monotonic() - started) * 1000.0
+
+            if header.startswith(b"OK"):
+                self._report_stat("get", drop, True, latency_ms, "OK")
+            elif header.startswith(b"MISS"):
+                self._report_stat("get", drop, True, latency_ms, "MISS")
+            else:
+                self._report_stat("get", drop, False, latency_ms, resp_str or "FAIL")
+
             return (drop, data)
 
         except Exception as e:
+            latency_ms = (time.monotonic() - started) * 1000.0
             print(f"[DROP GET FAIL] {drop}: {e}")
+            self._report_stat("get", drop, False, latency_ms, type(e).__name__)
             return (drop, None)
  
  

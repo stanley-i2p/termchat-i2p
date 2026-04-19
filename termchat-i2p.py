@@ -31,6 +31,7 @@ from PIL import Image
 import struct
 import random
 import hashlib
+import json
 
 from deaddrop import DeadDropClient
 from e2e import E2E
@@ -52,6 +53,11 @@ MAX_FILENAME = 128
 Image.MAX_IMAGE_PIXELS = 20_000_000
 
 MAX_ACTIVE_DEADDROP_REPLICAS = 3 # Offline replication const
+
+DD_STATS_EMA_ALPHA = 0.30
+DD_FAILURE_PENALTY = 2500.0
+DD_UNKNOWN_SERVER_SCORE = -1e18
+DD_STATS_SAVE_INTERVAL = 15.0
 
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".termchat-i2p")
 BASE_DIR = os.path.abspath(BASE_DIR)
@@ -572,6 +578,9 @@ class I2PChat(App):
         
         # Deaddrop servers, profile specific, loaded from file
         self.deaddrop_servers = []
+        self.deaddrop_stats = {}
+        self.deaddrop_stats_dirty = False
+        self.deaddrop_stats_last_save_ts = 0.0
         
         
         
@@ -579,6 +588,8 @@ class I2PChat(App):
             self.dd_session_id,
             self.deaddrop_servers
         )
+        
+        self.deaddrop.stats_callback = self.record_deaddrop_stat
 
         
         self.deaddrop_enabled = self.is_persistent_mode()
@@ -1656,6 +1667,184 @@ class I2PChat(App):
     
     
     
+    def deaddrop_stats_path(self) -> str:
+        return os.path.join(PROFILE_DIR, "deaddrop_stats.json")
+    
+    
+    
+    def _default_deaddrop_stat(self):
+        return {
+            "put_ok": 0,
+            "put_fail": 0,
+            "get_ok": 0,
+            "get_fail": 0,
+            "last_success_ts": 0.0,
+            "latency_ema_ms": 0.0,
+            "latency_samples": 0,
+        }
+
+    def load_deaddrop_stats(self):
+        if not self.is_persistent_mode():
+            return
+
+        path = self.deaddrop_stats_path()
+        if not os.path.exists(path):
+            self.deaddrop_stats = {}
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+
+            if isinstance(raw, dict):
+                cleaned = {}
+                for server, stats in raw.items():
+                    if not self.is_valid_deaddrop_server(server):
+                        continue
+
+                    base = self._default_deaddrop_stat()
+                    if isinstance(stats, dict):
+                        for k in base.keys():
+                            if k in stats:
+                                base[k] = stats[k]
+                    cleaned[server] = base
+
+                self.deaddrop_stats = cleaned
+            else:
+                self.deaddrop_stats = {}
+
+        except Exception as e:
+            self.deaddrop_stats = {}
+            self.post("error", f"Failed to load deaddrop stats: {e}")
+
+    def save_deaddrop_stats(self):
+        if not self.is_persistent_mode():
+            return
+
+        try:
+            path = self.deaddrop_stats_path()
+            content = json.dumps(self.deaddrop_stats, indent=2, sort_keys=True)
+            secure_write_text_atomic(path, content)
+        except Exception as e:
+            self.post("error", f"Failed to save deaddrop stats: {e}")
+            
+            
+            
+    def flush_deaddrop_stats_if_needed(self, force: bool = False):
+        if not self.is_persistent_mode():
+            return
+
+        if not self.deaddrop_stats_dirty and not force:
+            return
+
+        now = time.time()
+
+        if not force and (now - self.deaddrop_stats_last_save_ts) < DD_STATS_SAVE_INTERVAL:
+            return
+
+        self.save_deaddrop_stats()
+        self.deaddrop_stats_dirty = False
+        self.deaddrop_stats_last_save_ts = now
+            
+            
+
+    def ensure_deaddrop_stat_entry(self, server: str):
+        if server not in self.deaddrop_stats:
+            self.deaddrop_stats[server] = self._default_deaddrop_stat()
+
+    def record_deaddrop_stat(self, op: str, drop: str, ok: bool, latency_ms: float, detail: str):
+        drop = drop.strip().lower()
+
+        if not self.is_valid_deaddrop_server(drop):
+            return
+
+        self.ensure_deaddrop_stat_entry(drop)
+        st = self.deaddrop_stats[drop]
+
+        if op == "put":
+            if ok:
+                st["put_ok"] += 1
+            else:
+                st["put_fail"] += 1
+        elif op == "get":
+            if ok:
+                st["get_ok"] += 1
+            else:
+                st["get_fail"] += 1
+        else:
+            return
+
+        if ok:
+            st["last_success_ts"] = time.time()
+
+        if latency_ms > 0:
+            if st["latency_samples"] <= 0 or st["latency_ema_ms"] <= 0:
+                st["latency_ema_ms"] = float(latency_ms)
+            else:
+                alpha = DD_STATS_EMA_ALPHA
+                st["latency_ema_ms"] = (alpha * float(latency_ms)) + ((1.0 - alpha) * float(st["latency_ema_ms"]))
+            st["latency_samples"] += 1
+
+        self.rank_deaddrop_servers()
+        self.deaddrop_stats_dirty = True
+        self.flush_deaddrop_stats_if_needed()
+        
+        
+        
+        
+    def deaddrop_server_score(self, server: str) -> float:
+        st = self.deaddrop_stats.get(server)
+        if not st:
+            return DD_UNKNOWN_SERVER_SCORE
+
+        put_ok = float(st.get("put_ok", 0))
+        put_fail = float(st.get("put_fail", 0))
+        get_ok = float(st.get("get_ok", 0))
+        get_fail = float(st.get("get_fail", 0))
+
+        total_ok = put_ok + get_ok
+        total_fail = put_fail + get_fail
+        total = total_ok + total_fail
+
+        if total <= 0:
+            return DD_UNKNOWN_SERVER_SCORE
+
+        success_ratio = total_ok / total
+
+        latency = float(st.get("latency_ema_ms", 0.0))
+        if latency <= 0:
+            latency_component = 0.0
+        else:
+            latency_component = -latency
+
+        failure_penalty = total_fail * DD_FAILURE_PENALTY
+
+        last_success_ts = float(st.get("last_success_ts", 0.0))
+        recency_bonus = last_success_ts / 1000000.0 if last_success_ts > 0 else 0.0
+
+        return (success_ratio * 100000.0) + latency_component + recency_bonus - failure_penalty
+
+    def rank_deaddrop_servers(self):
+        if not self.deaddrop_servers:
+            self.apply_deaddrop_replica_policy()
+            return
+
+        original_order = {server: i for i, server in enumerate(self.deaddrop_servers)}
+
+        self.deaddrop_servers.sort(
+            key=lambda s: (
+                self.deaddrop_server_score(s),
+                -original_order.get(s, 10**9),
+            ),
+            reverse=True,
+        )
+
+        self.apply_deaddrop_replica_policy()
+        self.save_deaddrop_servers()
+        
+    
+    
+    
     def apply_deaddrop_replica_policy(self):
         active = list(self.deaddrop_servers[:MAX_ACTIVE_DEADDROP_REPLICAS])
         self.deaddrop.drops = active
@@ -1717,27 +1906,33 @@ class I2PChat(App):
 
         for s in new_servers:
             s = s.strip().lower()
-            
+
             if not self.is_valid_deaddrop_server(s):
                 continue
-            
+
             if s not in self.deaddrop_servers:
                 self.deaddrop_servers.append(s)
+                self.ensure_deaddrop_stat_entry(s)
                 changed = True
 
         if changed:
-            self.apply_deaddrop_replica_policy()
-            self.save_deaddrop_servers()
+            self.rank_deaddrop_servers()
+            self.deaddrop_stats_dirty = True
+            self.flush_deaddrop_stats_if_needed(force=True)
 
         return changed
 
 
     def prefer_deaddrop_server(self, server: str):
         if server in self.deaddrop_servers:
-            self.deaddrop_servers.remove(server)
-            self.deaddrop_servers.insert(0, server)
-            self.apply_deaddrop_replica_policy()
-            self.save_deaddrop_servers()
+            self.ensure_deaddrop_stat_entry(server)
+
+            st = self.deaddrop_stats[server]
+            st["last_success_ts"] = max(float(st.get("last_success_ts", 0.0)), time.time())
+
+            self.rank_deaddrop_servers()
+            self.deaddrop_stats_dirty = True
+            self.flush_deaddrop_stats_if_needed(force=True)
 
 
 
@@ -1776,9 +1971,28 @@ class I2PChat(App):
 
 
     def show_deaddrop_servers(self):
-        self.post("system", f"Known deaddrop servers: {len(self.deaddrop_servers)}")
+        self.post(
+            "system",
+            f"Known deaddrop servers: {len(self.deaddrop_servers)} "
+            f"(active replicas: {len(self.deaddrop.drops)})"
+        )
+
         for i, s in enumerate(self.deaddrop_servers, start=1):
-            self.post("system", f"  {i}. {s}")
+            st = self.deaddrop_stats.get(s, {})
+            put_ok = st.get("put_ok", 0)
+            put_fail = st.get("put_fail", 0)
+            get_ok = st.get("get_ok", 0)
+            get_fail = st.get("get_fail", 0)
+            latency = st.get("latency_ema_ms", 0.0)
+
+            active_tag = " *" if s in self.deaddrop.drops else ""
+            self.post(
+                "system",
+                f"  {i}. {s}{active_tag} "
+                f"[put ok/fail={put_ok}/{put_fail} "
+                f"get ok/fail={get_ok}/{get_fail} "
+                f"lat={latency:.1f}ms]"
+            )
 
 
     def add_deaddrop_server(self, server: str):
@@ -1793,8 +2007,10 @@ class I2PChat(App):
             return
 
         self.deaddrop_servers.append(server)
-        self.deaddrop.drops = list(self.deaddrop_servers)
-        self.save_deaddrop_servers()
+        self.ensure_deaddrop_stat_entry(server)
+        self.rank_deaddrop_servers()
+        self.deaddrop_stats_dirty = True
+        self.flush_deaddrop_stats_if_needed(force=True)
         self.post("success", f"Added deaddrop server: {server}")
 
 
@@ -1804,8 +2020,14 @@ class I2PChat(App):
             return
 
         removed = self.deaddrop_servers.pop(index - 1)
-        self.deaddrop.drops = list(self.deaddrop_servers)
+
+        if removed in self.deaddrop_stats:
+            del self.deaddrop_stats[removed]
+
+        self.apply_deaddrop_replica_policy()
         self.save_deaddrop_servers()
+        self.deaddrop_stats_dirty = True
+        self.flush_deaddrop_stats_if_needed(force=True)
         self.post("success", f"Removed deaddrop server: {removed}")
 
 
@@ -1884,7 +2106,10 @@ class I2PChat(App):
 
             self.ensure_profile_deaddrop_servers_file()
 
+            self.load_deaddrop_stats()
             self.load_deaddrop_servers()
+            self.rank_deaddrop_servers()
+            
 
             await self.sam.create_session(
                 self.session_id,
@@ -3306,6 +3531,12 @@ if __name__ == "__main__":
         app = I2PChat()
         app.run()
     finally:
+        if app is not None:
+            try:
+                app.flush_deaddrop_stats_if_needed(force=True)
+            except Exception:
+                pass
+
         if os.path.exists(BASE_DIR):
             try:
                 remaining = fs_runtime_leave(BASE_DIR)
