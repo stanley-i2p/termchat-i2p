@@ -59,6 +59,11 @@ DD_FAILURE_PENALTY = 2500.0
 DD_UNKNOWN_SERVER_SCORE = -1e18
 DD_STATS_SAVE_INTERVAL = 15.0
 
+HEARTBEAT_PING_INTERVAL = 10.0
+HEARTBEAT_TIMEOUT = 35.0
+HEARTBEAT_PING_PREFIX = "__SIGNAL__:PING:"
+HEARTBEAT_PONG_PREFIX = "__SIGNAL__:PONG:"
+
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".termchat-i2p")
 BASE_DIR = os.path.abspath(BASE_DIR)
 
@@ -454,6 +459,17 @@ FS_INSTANCE_COUNT = fs_runtime_enter(BASE_DIR)
 
 
 
+class ChatInput(Input):
+    def _on_paste(self, event: events.Paste) -> None:
+        if event.text:
+            selection = self.selection
+            if selection.is_empty:
+                self.insert_text_at_cursor(event.text)
+            else:
+                self.replace(event.text, *selection)
+        event.stop()
+
+
 class I2PChat(App):
     # This maps "q" or "ctrl+q" to the action "quit"
     BINDINGS = [("q", "quit", "Quit"), ("ctrl+q", "quit", "Quit"), ("c", "copy_my_addr", "Copy My B32")]
@@ -509,6 +525,9 @@ class I2PChat(App):
         self.sock = None  # LISTENER
         self.conn = None  # ACTIVE CHAT
         self.live_ready = False
+        self.heartbeat_last_rx_ts = 0.0
+        self.heartbeat_last_ping_ts = 0.0
+        self.heartbeat_task = None
         self.publish_ready = False
         
         
@@ -558,6 +577,7 @@ class I2PChat(App):
         self.image_buffer = []
         
         self.pending_messages = {}
+        self.chat_history = []
         
         # Command history init
         self.command_history = []
@@ -623,7 +643,7 @@ class I2PChat(App):
         yield RichLog(id="chat_window", highlight=False, markup=True)
 
         with Container(id="bottom_bar"):
-            yield Input(placeholder="Type message and press Enter...", id="chat_input")
+            yield ChatInput(placeholder="Type message and press Enter...", id="chat_input")
             yield Static(id="command_bar")
         
 
@@ -871,7 +891,87 @@ class I2PChat(App):
 
      
 
-    def post(self, type_name: str, message: str):
+    def format_chat_message(self, message: str) -> str:
+        safe_message = re.sub(r'[\x00-\x1F\x7F]', '', str(message))
+        safe_message = escape(safe_message)
+
+        address_pattern = r"([a-z0-9]+\.b32\.i2p|[a-z0-9]+\.i2p)"
+        return re.sub(address_pattern, r"[bold cyan]\1[/]", safe_message)
+
+
+    def render_chat_entry(self, entry):
+        if entry.get("kind") == "bubble":
+            type_name = entry["type"]
+            formatted_msg = self.format_chat_message(entry["message"])
+
+            if type_name == "me":
+                box_color = "green"
+                display_name = "Me"
+                alignment = "left"
+            elif type_name == "peer":
+                box_color = "cyan"
+                display_name = "Peer"
+                alignment = "right"
+            elif type_name == "me_offline":
+                box_color = "yellow"
+                display_name = "Me-Offline"
+                alignment = "left"
+            else:
+                box_color = "magenta"
+                display_name = "Peer-Offline"
+                alignment = "right"
+
+            delivery = ""
+            if entry.get("msg_id") is not None and entry.get("delivered"):
+                mark = "✓" if type_name == "me_offline" else "✓✓"
+                delivery = f" [dim green]{mark}[/]"
+
+            message_panel = Panel(
+                f"[white]{formatted_msg}[/]",
+                title=f"[#5f5f5f][{entry['timestamp']} UTC][/] [bold {box_color}]{display_name}[/]{delivery}",
+                title_align="left",
+                border_style=box_color,
+                box=box.ROUNDED,
+                expand=False
+            )
+
+            return Align(message_panel, align=alignment), True
+
+        if entry.get("kind") == "image":
+            message_panel = Panel(
+                entry["content"],
+                title=f"[#5f5f5f][{entry['timestamp']} UTC][/] [bold {entry['color']}]{entry['display']}[/]",
+                title_align="left",
+                border_style=entry["color"],
+                box=box.ROUNDED,
+                expand=False
+            )
+
+            return Align(message_panel, align=entry["alignment"]), True
+
+        return entry["content"], False
+
+
+    def append_chat_entry(self, entry):
+        self.chat_history.append(entry)
+        renderable, expand = self.render_chat_entry(entry)
+        self.chat_log.write(renderable, expand=expand)
+        return entry
+
+
+    def rerender_chat_history(self):
+        self.chat_log.clear()
+        for entry in self.chat_history:
+            renderable, expand = self.render_chat_entry(entry)
+            self.chat_log.write(renderable, expand=expand)
+
+
+    def mark_chat_entry_delivered(self, entry):
+        entry["delivered"] = True
+        self.rerender_chat_history()
+
+
+    def post(self, type_name: str, message: str, msg_id=None):
         
         styles = {
             "info": "[bold blue]STATUS:[/] [white]{}[/]",
@@ -889,12 +989,7 @@ class I2PChat(App):
         }
         
         
-        safe_message = re.sub(r'[\x00-\x1F\x7F]', '', str(message))
-        safe_message = escape(safe_message)
-        
-        
-        address_pattern = r"([a-z0-9]+\.b32\.i2p|[a-z0-9]+\.i2p)"
-        formatted_msg = re.sub(address_pattern, r"[bold cyan]\1[/]", safe_message)
+        formatted_msg = self.format_chat_message(message)
 
         
         content = styles.get(type_name, "{}").format(formatted_msg)
@@ -903,39 +998,20 @@ class I2PChat(App):
         
         if type_name in ["me", "peer", "me_offline", "peer_offline"]:
             now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            
-            
-            if type_name == "me":
-                box_color = "green"
-                display_name = "Me"
-                alignment = "left"
-            elif type_name == "peer":
-                box_color = "cyan"
-                display_name = "Peer"
-                alignment = "right"
-            elif type_name == "me_offline":
-                box_color = "yellow"
-                display_name = "Me-Offline"
-                alignment = "left"
-            else:
-                box_color = "magenta"
-                display_name = "Peer-Offline"
-                alignment = "right"
-            
-            
-            message_panel = Panel(
-                f"[white]{formatted_msg}[/]",
-                title=f"[#5f5f5f][{now_utc} UTC][/] [bold {box_color}]{display_name}[/]",
-                title_align="left",
-                border_style=box_color,
-                box=box.ROUNDED,
-                expand=False
-            )
-            
-            self.chat_log.write(Align(message_panel, align=alignment), expand=True)
+            return self.append_chat_entry({
+                "kind": "bubble",
+                "type": type_name,
+                "message": message,
+                "timestamp": now_utc,
+                "msg_id": msg_id,
+                "delivered": False,
+            })
 
         else:
-            self.chat_log.write(content)
+            return self.append_chat_entry({
+                "kind": "raw",
+                "content": content,
+            })
             
             
     
@@ -1057,6 +1133,7 @@ class I2PChat(App):
         if self.e2e.ready() and not self.live_ready:
             self.live_ready = True
             self.pq_active = self.pq_enabled
+            self.start_heartbeat()
             self.watch_peer_b32(self.peer_b32)
             
             self.update_command_bar()
@@ -1070,6 +1147,94 @@ class I2PChat(App):
                 asyncio.create_task(self.send_deaddrop_server_list())
         
         
+
+
+    def heartbeat_nonce(self) -> str:
+        return f"{self.generate_msg_id():016x}"
+
+
+    def reset_heartbeat_state(self):
+        self.heartbeat_last_rx_ts = 0.0
+        self.heartbeat_last_ping_ts = 0.0
+
+
+    def mark_heartbeat_rx(self):
+        self.heartbeat_last_rx_ts = time.monotonic()
+
+
+    def stop_heartbeat(self):
+        if self.heartbeat_task:
+            try:
+                self.heartbeat_task.cancel()
+            except:
+                pass
+            self.heartbeat_task = None
+        self.reset_heartbeat_state()
+
+
+    def start_heartbeat(self):
+        if not self.conn or not self.live_ready:
+            return
+
+        now = time.monotonic()
+        if self.heartbeat_last_rx_ts == 0.0:
+            self.heartbeat_last_rx_ts = now
+        if self.heartbeat_last_ping_ts == 0.0:
+            self.heartbeat_last_ping_ts = now
+
+        if self.heartbeat_task and not self.heartbeat_task.done():
+            return
+
+        self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.conn))
+
+
+    async def heartbeat_loop(self, connection):
+        try:
+            while self.conn == connection:
+                await asyncio.sleep(1.0)
+
+                if self.conn != connection:
+                    break
+                if not self.live_ready:
+                    continue
+
+                reader, writer = connection
+                if writer.is_closing():
+                    break
+
+                now = time.monotonic()
+                if self.heartbeat_last_rx_ts == 0.0:
+                    self.heartbeat_last_rx_ts = now
+
+                if now - self.heartbeat_last_rx_ts >= HEARTBEAT_TIMEOUT:
+                    self.post("disconnect", "Peer heartbeat timed out.")
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except:
+                        pass
+                    break
+
+                if (
+                    now - self.heartbeat_last_ping_ts >= HEARTBEAT_PING_INTERVAL
+                    and now - self.heartbeat_last_rx_ts >= HEARTBEAT_PING_INTERVAL
+                ):
+                    self.heartbeat_last_ping_ts = now
+                    writer.write(
+                        self.frame_message(
+                            'S',
+                            f"{HEARTBEAT_PING_PREFIX}{self.heartbeat_nonce()}"
+                        )
+                    )
+                    await writer.drain()
+
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        finally:
+            if self.heartbeat_task == asyncio.current_task():
+                self.heartbeat_task = None
 
 
     def clear_pending_incoming(self):
@@ -1228,6 +1393,7 @@ class I2PChat(App):
 
         self.conn = (reader, writer)
         self.live_ready = self.e2e.ready()
+        self.start_heartbeat()
         
         self.watch_peer_b32(self.peer_b32)
         self.update_command_bar()
@@ -2056,7 +2222,10 @@ class I2PChat(App):
         is_persistent = self.profile != "default"
         
         
-        self.chat_log.write(f"[#878700]SYSTEM:[/] [dim #5f5f5f italic]Mode:[/][not bold {'yellow' if is_persistent else 'green'}] {'PERSISTENT' if is_persistent else 'TRANSIENT'}[/]")
+        self.append_chat_entry({
+            "kind": "raw",
+            "content": f"[#878700]SYSTEM:[/] [dim #5f5f5f italic]Mode:[/][not bold {'yellow' if is_persistent else 'green'}] {'PERSISTENT' if is_persistent else 'TRANSIENT'}[/]",
+        })
 
         
         
@@ -2166,7 +2335,10 @@ class I2PChat(App):
             
             
         except Exception as e:
-            self.chat_log.write(f"[red]Initialization Error:[/] {e}")
+            self.append_chat_entry({
+                "kind": "raw",
+                "content": f"[red]Initialization Error:[/] {e}",
+            })
             self.network_status = "initializing"
             
             try:
@@ -2446,21 +2618,31 @@ class I2PChat(App):
             
             
         elif self.conn and self.live_ready:
+            msg_id = None
             try:
                 _, writer = self.conn
                 
                 cipher = self.e2e.encrypt(msg.encode())
                 frame = self.frame_message('U', cipher)
                 msg_id = struct.unpack(">Q", frame[6:14])[0]
+                pending_entry = {
+                    "kind": "bubble",
+                    "type": "me",
+                    "message": msg,
+                    "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                    "msg_id": msg_id,
+                    "delivered": False,
+                }
+                self.pending_messages[msg_id] = pending_entry
                 
-                self.pending_messages[msg_id] = msg
-
                 writer.write(frame)
                 await writer.drain()
                 
 
-                self.post("me", msg)
+                self.append_chat_entry(pending_entry)
             except Exception:
+                if msg_id is not None:
+                    self.pending_messages.pop(msg_id, None)
                 self.post("error", "Failed to send message.")
                 self.conn = None
                 self.live_ready = False
@@ -2472,43 +2654,35 @@ class I2PChat(App):
             try:
                 blob_key = self.get_offline_blob_key()
                 frame = self.frame_message('U', msg.encode())
+                msg_id = struct.unpack(">Q", frame[6:14])[0]
                 blob = self.e2e.encrypt_offline_blob(frame, blob_key)
+                pending_entry = {
+                    "kind": "bubble",
+                    "type": "me_offline",
+                    "message": msg,
+                    "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                    "msg_id": msg_id,
+                    "delivered": False,
+                }
+                self.append_chat_entry(pending_entry)
 
-                max_attempts = 8
-                queued = False
+                send_index = self.drop_send_index
+                dd_key = self.derive_deaddrop_key("send", send_index)
 
-                for _ in range(max_attempts):
-                    send_index = self.drop_send_index
-                    dd_key = self.derive_deaddrop_key("send", send_index)
-                    
+                status, ok_drops = await self.deaddrop.put(dd_key, blob)
 
-                    status, ok_drops = await self.deaddrop.put(dd_key, blob)
+                if status in ("OK", "EXISTS"):
+                    if ok_drops:
+                        self.prefer_deaddrop_server(ok_drops[0])
 
-                    if status == "OK":
-                        
-                        if ok_drops:
-                            self.prefer_deaddrop_server(ok_drops[0])
-                        
-                        self.drop_send_index += 1
-                        self.save_offline_state()
-                        self.set_dd_status("put_ok")
-                        self.post("me_offline", msg)
-                        #self.post("system", f"[OFFLINE] queued and replicated via deaddrops key_index={send_index}")
-                        queued = True
-                        break
-
-                    elif status == "EXISTS":
-                        self.drop_send_index += 1
-                        continue
-
-                    else:
-                        self.set_dd_status("put_fail")
-                        self.post("error", "[OFFLINE send failed] deaddrop PUT did not succeed")
-                        break
-
-                if not queued and status == "EXISTS":
+                    self.drop_send_index += 1
+                    self.save_offline_state()
+                    self.set_dd_status("put_ok")
+                    self.mark_chat_entry_delivered(pending_entry)
+                    #self.post("system", f"[OFFLINE] queued and replicated via deaddrops key_index={send_index}")
+                else:
                     self.set_dd_status("put_fail")
-                    self.post("error", f"[OFFLINE] key collision after {max_attempts} attempts")
+                    self.post("error", "[OFFLINE send failed] deaddrop PUT did not succeed")
 
             except Exception as e:
                 self.set_dd_status("put_fail")
@@ -2669,6 +2843,8 @@ class I2PChat(App):
                 # READ full frame. MAGIC based protocol
                 try:
                     msg_type, msg_id, payload = await self.read_frame(reader)
+                    if self.conn == connection:
+                        self.mark_heartbeat_rx()
                     
                     # Decrypt payload if encrypted
                     if msg_type not in ('K','P','O','S','D'):
@@ -2695,6 +2871,7 @@ class I2PChat(App):
             if self.conn == connection:
                 
                 self.reset_transfer_state()
+                self.stop_heartbeat()
                 self.watch_peer_b32(self.peer_b32)
                 
                 self.conn = None
@@ -2737,12 +2914,8 @@ class I2PChat(App):
             delivered_id = struct.unpack(">Q", payload)[0]
 
             if delivered_id in self.pending_messages:
-                msg = self.pending_messages.pop(delivered_id)
-
-                self.chat_log.write(
-                    Align("[dim green] ✓ [/]", align="left"),
-                    expand=True
-                )
+                entry = self.pending_messages.pop(delivered_id)
+                self.mark_chat_entry_delivered(entry)
 
         elif msg_type == 'I':
 
@@ -2751,16 +2924,14 @@ class I2PChat(App):
                 now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
                 img_text = "\n".join(self.image_buffer)
 
-                message_panel = Panel(
-                    img_text,
-                    title=f"[#5f5f5f][{now_utc} UTC][/] [bold cyan]Peer[/]",
-                    title_align="left",
-                    border_style="cyan",
-                    box=box.ROUNDED,
-                    expand=False
-                )
-
-                self.chat_log.write(Align(message_panel, align="right"), expand=True)
+                self.append_chat_entry({
+                    "kind": "image",
+                    "content": img_text,
+                    "timestamp": now_utc,
+                    "display": "Peer",
+                    "color": "cyan",
+                    "alignment": "right",
+                })
                 self.image_buffer = []
 
             else:
@@ -2831,6 +3002,21 @@ class I2PChat(App):
 
             if "__SIGNAL__:" in body:
 
+                if body.startswith(HEARTBEAT_PING_PREFIX):
+                    nonce = body[len(HEARTBEAT_PING_PREFIX):]
+                    if writer is not None:
+                        writer.write(
+                            self.frame_message(
+                                'S',
+                                f"{HEARTBEAT_PONG_PREFIX}{nonce}"
+                            )
+                        )
+                        await writer.drain()
+                    return
+
+                if body.startswith(HEARTBEAT_PONG_PREFIX):
+                    return
+
                 if "QUIT" in body:
                     if source == "pending":
                         caller = self.pending_incoming_addr or "Unknown"
@@ -2856,6 +3042,7 @@ class I2PChat(App):
                         return
 
                     self.post("system", "Peer requested disconnect.")
+                    return
 
             else:
                 try:
@@ -2919,6 +3106,7 @@ class I2PChat(App):
                 
                 self.live_ready = True
                 self.pq_active = False
+                self.start_heartbeat()
                 self.watch_peer_b32(self.peer_b32)
                 
                 self.update_command_bar()
@@ -3141,16 +3329,14 @@ class I2PChat(App):
         now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
         img_text = "\n".join(lines)
 
-        message_panel = Panel(
-            img_text,
-            title=f"[#5f5f5f][{now_utc} UTC][/] [bold green]Me[/]",
-            title_align="left",
-            border_style="green",
-            box=box.ROUNDED,
-            expand=False
-        )
-
-        self.chat_log.write(Align(message_panel, align="left"), expand=True)
+        self.append_chat_entry({
+            "kind": "image",
+            "content": img_text,
+            "timestamp": now_utc,
+            "display": "Me",
+            "color": "green",
+            "alignment": "left",
+        })
 
         for line in lines:
             
@@ -3188,6 +3374,7 @@ class I2PChat(App):
             self.conn = None
             self.live_ready = False
             self.pq_active = False
+            self.stop_heartbeat()
             self.current_peer_dest_b64 = None
             self.peer_b32 = "Waiting for incoming connections..."
             self.clear_tofu_runtime_status()
@@ -3546,4 +3733,3 @@ if __name__ == "__main__":
                     print("[OK] Filesystem storage encrypted.")
             except Exception as e:
                 print(f"[FS_ENCRYPT ERROR] Failed to encrypt storage: {e}")
-
