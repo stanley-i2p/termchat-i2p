@@ -6,10 +6,13 @@ import shutil
 import stat
 import getpass
 import tarfile
+from io import BytesIO
+import tempfile
 
 import asyncio
 from textual.app import App, ComposeResult
 from textual import events
+from textual.screen import ModalScreen
 from textual.widgets import Input, RichLog
 from textual.containers import Container
 from textual.reactive import reactive
@@ -35,6 +38,8 @@ import json
 
 from deaddrop import DeadDropClient
 from e2e import E2E
+from file_picker import FilePickerScreen
+from help_screen import HELP_LINES, HelpScreen
 from sam_client import SAMClient
 
 from vault import fs_decrypt, fs_encrypt, fs_runtime_enter, fs_runtime_leave, fs_verify_passphrase
@@ -49,6 +54,8 @@ MAX_FRAME_SIZE = 256 * 1024      # 256 KB max protocol frame
 MAX_FILE_SIZE = 50 * 1024 * 1024 # 50 MB max file
 MAX_IMAGE_LINES = 2000           # prevents huge ASCII images
 MAX_FILENAME = 128
+IMAGE_TRANSFER_MAX_DIMENSION = 1280
+IMAGE_TRANSFER_JPEG_QUALITY = 82
 
 Image.MAX_IMAGE_PIXELS = 20_000_000
 
@@ -574,7 +581,12 @@ class I2PChat(App):
         self.rx_start_time = None
         
         
-        self.image_buffer = []
+        self.incoming_image_name = None
+        self.incoming_image_mime = None
+        self.incoming_image_expected = 0
+        self.incoming_image_received = 0
+        self.incoming_image_msg_id = 0
+        self.incoming_image_bytes = bytearray()
         
         self.pending_messages = {}
         self.chat_history = []
@@ -848,6 +860,9 @@ class I2PChat(App):
         if event.key not in ("up", "down"):
             return
 
+        if isinstance(self.screen, ModalScreen):
+            return
+
         #input_widget = self.query_one(Input)
         input_widget = self.query_one("#chat_input", Input)
 
@@ -938,9 +953,13 @@ class I2PChat(App):
             return Align(message_panel, align=alignment), True
 
         if entry.get("kind") == "image":
+            delivery = ""
+            if entry.get("msg_id") is not None and entry.get("delivered"):
+                delivery = " [dim green]✓✓[/]"
+
             message_panel = Panel(
                 entry["content"],
-                title=f"[#5f5f5f][{entry['timestamp']} UTC][/] [bold {entry['color']}]{entry['display']}[/]",
+                title=f"[#5f5f5f][{entry['timestamp']} UTC][/] [bold {entry['color']}]{entry['display']}[/]{delivery}",
                 title_align="left",
                 border_style=entry["color"],
                 box=box.ROUNDED,
@@ -1015,12 +1034,13 @@ class I2PChat(App):
             
             
     
-    def frame_message(self, msg_type: str, payload):
+    def frame_message(self, msg_type: str, payload, msg_id=None):
 
         if isinstance(payload, str):
             payload = payload.encode()
 
-        msg_id = self.generate_msg_id()
+        if msg_id is None:
+            msg_id = self.generate_msg_id()
 
         header = struct.pack(">4sBcQI", MAGIC, PROTOCOL_VERSION, msg_type.encode(), msg_id, len(payload))
         
@@ -1054,7 +1074,7 @@ class I2PChat(App):
         if version != PROTOCOL_VERSION:
             raise ValueError("Unsupported protocol version")
         
-        if msg_type not in b"UDISFCEKPOXLQY":
+        if msg_type not in b"UDSFCEKPOXLQYJGZ":
             raise ValueError("Unknown frame type")
 
     
@@ -1080,7 +1100,7 @@ class I2PChat(App):
         if version != PROTOCOL_VERSION:
             raise ValueError("Unsupported protocol version")
 
-        if msg_type not in b"UDISFCEKPOXLQY":
+        if msg_type not in b"UDSFCEKPOXLQYJGZ":
             raise ValueError("Unknown frame type")
 
         if length < 0 or length > MAX_FRAME_SIZE:
@@ -1097,6 +1117,116 @@ class I2PChat(App):
     
     def generate_msg_id(self):
         return (int(time.time() * 1000) ^ random.getrandbits(32)) & 0xFFFFFFFFFFFFFFFF
+
+
+    def image_mime_for_path(self, path: str):
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        mapping = {
+            "png": "image/png",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "gif": "image/gif",
+            "bmp": "image/bmp",
+            "webp": "image/webp",
+        }
+        return mapping.get(ext)
+
+
+    def is_supported_image_mime(self, mime: str) -> bool:
+        return mime in {"image/png", "image/jpeg", "image/gif", "image/bmp", "image/webp"}
+
+
+    def prepare_image_preview_bytes(self, path: str):
+        if not os.path.exists(path):
+            raise RuntimeError(f"File not found: {path}")
+
+        source_size = os.path.getsize(path)
+        if source_size <= 0:
+            raise RuntimeError("Image is empty.")
+        if source_size > MAX_FILE_SIZE:
+            raise RuntimeError(
+                f"Image source is too large for inline preview ({source_size} bytes). Use /sendfile for the original."
+            )
+
+        try:
+            decoded = Image.open(path)
+            decoded.load()
+        except Exception as e:
+            raise RuntimeError(f"Image decode failed: {e}")
+
+        keep_alpha = (
+            decoded.mode in ("RGBA", "LA")
+            or (decoded.mode == "P" and "transparency" in decoded.info)
+        )
+
+        preview = decoded.copy()
+        if preview.width > IMAGE_TRANSFER_MAX_DIMENSION or preview.height > IMAGE_TRANSFER_MAX_DIMENSION:
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+            preview.thumbnail(
+                (IMAGE_TRANSFER_MAX_DIMENSION, IMAGE_TRANSFER_MAX_DIMENSION),
+                resampling,
+            )
+
+        out = BytesIO()
+        if keep_alpha:
+            preview.convert("RGBA").save(out, format="PNG")
+            return out.getvalue(), "image/png"
+
+        preview.convert("RGB").save(
+            out,
+            format="JPEG",
+            quality=IMAGE_TRANSFER_JPEG_QUALITY,
+        )
+        return out.getvalue(), "image/jpeg"
+
+
+    def image_suffix_for_mime(self, mime: str) -> str:
+        mapping = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/gif": ".gif",
+            "image/bmp": ".bmp",
+            "image/webp": ".webp",
+        }
+        return mapping.get(mime, ".img")
+
+
+    def render_image_bytes_for_terminal(self, image_bytes: bytes, mime: str, mode: str = "braille") -> str:
+        secure_makedirs(IMAGE_DIR)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                dir=IMAGE_DIR,
+                suffix=self.image_suffix_for_mime(mime),
+            ) as tmp:
+                tmp.write(image_bytes)
+                tmp_path = tmp.name
+
+            try:
+                os.chmod(tmp_path, FILE_MODE)
+            except:
+                pass
+
+            lines = render_bw(tmp_path) if mode == "bw" else render_braille(tmp_path)
+            if len(lines) > MAX_IMAGE_LINES:
+                raise RuntimeError("Image too large to render safely")
+            return "\n".join(lines)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except:
+                    pass
+
+
+    def clear_incoming_image_state(self):
+        self.incoming_image_name = None
+        self.incoming_image_mime = None
+        self.incoming_image_expected = 0
+        self.incoming_image_received = 0
+        self.incoming_image_msg_id = 0
+        self.incoming_image_bytes = bytearray()
 
 
     def peer_dest_fingerprint(self, dest_b64: str) -> str:
@@ -1125,6 +1255,30 @@ class I2PChat(App):
         self.tofu_verified = False
         self.tofu_mismatch = False
         self.watch_peer_b32(self.peer_b32)
+        
+        
+    def open_file_picker(self, image_mode: str | None = None):
+        image_extensions = {"png", "jpg", "jpeg", "gif", "bmp", "webp"}
+        allowed = image_extensions if image_mode else None
+        title = "Choose image" if image_mode else "Choose file"
+
+        def handle_selection(path):
+            if not path:
+                return
+
+            if not self.conn:
+                self.post("error", "No active connection. Use /connect <address>.")
+                return
+
+            if image_mode:
+                self.run_worker(self.send_image(path, mode=image_mode))
+            else:
+                self.run_worker(self.send_file(path))
+
+        self.push_screen(
+            FilePickerScreen(title, allowed_extensions=allowed),
+            callback=handle_selection,
+        )
         
         
         
@@ -1275,7 +1429,7 @@ class I2PChat(App):
                 try:
                     msg_type, msg_id, payload = await self.read_frame(reader)
 
-                    if msg_type not in ('K', 'P', 'O', 'S', 'D'):
+                    if msg_type not in ('K', 'P', 'O', 'S', 'D', 'Z'):
                         payload = self.e2e.decrypt(payload)
 
                 except UnicodeDecodeError:
@@ -2524,10 +2678,13 @@ class I2PChat(App):
 
             parts = msg.split(" ", 1)
             if len(parts) < 2:
-                self.post("error", "Usage: /sendfile <path>")
+                self.open_file_picker()
                 return
 
             path = parts[1].strip()
+            if not path:
+                self.open_file_picker()
+                return
 
             if not os.path.exists(path):
                 self.post("error", "File not found.")
@@ -2537,12 +2694,24 @@ class I2PChat(App):
          
         
         
+        elif msg.strip() == "/img":
+            if not self.conn:
+                self.post("error", "No active connection. Use /connect <address>.")
+                return
+            
+            self.open_file_picker(image_mode="braille")
+            
+        
+        
         elif msg.startswith("/img "):
             if not self.conn:
                 self.post("error", "No active connection. Use /connect <address>.")
                 return
             
             path = msg[5:].strip()
+            if not path:
+                self.open_file_picker(image_mode="braille")
+                return
 
             if not os.path.exists(path):
                 self.post("error", f"File not found: {path}")
@@ -2551,12 +2720,23 @@ class I2PChat(App):
             await self.send_image(path, mode="braille")
             
             
+        elif msg.strip() == "/img-bw":
+            if not self.conn:
+                self.post("error", "No active connection. Use /connect <address>.")
+                return
+            
+            self.open_file_picker(image_mode="bw")
+            
+            
         elif msg.startswith("/img-bw "):
             if not self.conn:
                 self.post("error", "No active connection. Use /connect <address>.")
                 return
             
             path = msg[7:].strip()
+            if not path:
+                self.open_file_picker(image_mode="bw")
+                return
 
             if not os.path.exists(path):
                 self.post("error", f"File not found: {path}")
@@ -2847,7 +3027,7 @@ class I2PChat(App):
                         self.mark_heartbeat_rx()
                     
                     # Decrypt payload if encrypted
-                    if msg_type not in ('K','P','O','S','D'):
+                    if msg_type not in ('K','P','O','S','D','Z'):
                         payload = self.e2e.decrypt(payload)
                     
                 except UnicodeDecodeError:
@@ -2917,26 +3097,106 @@ class I2PChat(App):
                 entry = self.pending_messages.pop(delivered_id)
                 self.mark_chat_entry_delivered(entry)
 
-        elif msg_type == 'I':
+        elif msg_type == 'J':
+            try:
+                parts = body.split("|", 2)
+                if len(parts) != 3:
+                    self.post("error", "Invalid image header.")
+                    return
 
-            if body == "__END__":
+                filename = os.path.basename(parts[0])[:MAX_FILENAME] or "image"
+                mime = parts[1].strip()
+                total = int(parts[2])
 
-                now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                img_text = "\n".join(self.image_buffer)
+                if total <= 0 or total > MAX_FILE_SIZE:
+                    self.post("error", f"Rejected image size: {total} bytes.")
+                    return
+
+                if not self.is_supported_image_mime(mime):
+                    self.post("error", f"Unsupported incoming image type: {mime}")
+                    return
+
+                self.clear_incoming_image_state()
+                self.incoming_image_name = filename
+                self.incoming_image_mime = mime
+                self.incoming_image_expected = total
+                self.incoming_image_received = 0
+                self.incoming_image_msg_id = msg_id
+                self.incoming_image_bytes = bytearray()
+
+            except Exception as e:
+                self.post("error", f"Invalid image header: {e}")
+
+        elif msg_type == 'G':
+            try:
+                if not self.incoming_image_name:
+                    self.post("error", "Image chunk received without image header.")
+                    return
+
+                if self.incoming_image_msg_id != msg_id:
+                    self.post("error", "Image chunk transfer id mismatch.")
+                    return
+
+                chunk = base64.b64decode(payload, validate=True)
+                next_total = self.incoming_image_received + len(chunk)
+
+                if next_total > self.incoming_image_expected:
+                    self.post("error", "Image transfer overflow detected.")
+                    self.clear_incoming_image_state()
+                    return
+
+                self.incoming_image_bytes.extend(chunk)
+                self.incoming_image_received = next_total
+
+            except Exception as e:
+                self.post("error", f"Image chunk decode failed: {e}")
+                self.clear_incoming_image_state()
+
+        elif msg_type == 'Z':
+            try:
+                if not self.incoming_image_name:
+                    self.post("error", "Image end received without image header.")
+                    return
+
+                if self.incoming_image_msg_id != msg_id:
+                    self.post("error", "Image end transfer id mismatch.")
+                    return
+
+                if self.incoming_image_received != self.incoming_image_expected:
+                    self.post(
+                        "error",
+                        f"Incomplete image transfer: {self.incoming_image_received}/{self.incoming_image_expected} bytes."
+                    )
+                    self.clear_incoming_image_state()
+                    return
+
+                image_mime = self.incoming_image_mime or "image/png"
+                image_bytes = bytes(self.incoming_image_bytes)
+                img_text = self.render_image_bytes_for_terminal(image_bytes, image_mime)
 
                 self.append_chat_entry({
                     "kind": "image",
                     "content": img_text,
-                    "timestamp": now_utc,
+                    "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
                     "display": "Peer",
                     "color": "cyan",
                     "alignment": "right",
                 })
-                self.image_buffer = []
 
-            else:
-                if len(self.image_buffer) < MAX_IMAGE_LINES:
-                    self.image_buffer.append(body)
+                self.clear_incoming_image_state()
+
+                if writer is not None:
+                    writer.write(
+                        self.frame_message(
+                            'D',
+                            struct.pack(">Q", msg_id)
+                        )
+                    )
+                    await writer.drain()
+
+            except Exception as e:
+                self.post("error", f"Image receive failed: {e}")
+                self.clear_incoming_image_state()
 
         elif msg_type == 'F':
             try:
@@ -3314,41 +3574,74 @@ class I2PChat(App):
 
         reader, writer = self.conn
 
-       
-        # Choose renderer
-        if mode == "bw":
-            lines = render_bw(path)
-        else:
-            lines = render_braille(path)
-            
-        if len(lines) > MAX_IMAGE_LINES:
-            self.post("error", "Image too large to render safely")
+        if self.image_mime_for_path(path) is None:
+            self.post("error", "Unsupported image type.")
             return
-        
-        # Show locally with same bubble style
-        now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        img_text = "\n".join(lines)
 
-        self.append_chat_entry({
-            "kind": "image",
-            "content": img_text,
-            "timestamp": now_utc,
-            "display": "Me",
-            "color": "green",
-            "alignment": "left",
-        })
+        msg_id = None
 
-        for line in lines:
-            
-            cipher = self.e2e.encrypt(line.encode())
-            writer.write(self.frame_message('I', cipher))
-            
-        cipher = self.e2e.encrypt(b"__END__")
-        writer.write(self.frame_message('I', cipher))
+        try:
+            image_bytes, mime = self.prepare_image_preview_bytes(path)
 
-        await writer.drain()
+            if not image_bytes:
+                self.post("error", "Image preview is empty.")
+                return
 
-        self.post("success", f"Image sent: {path}")
+            if len(image_bytes) > MAX_FILE_SIZE:
+                self.post("error", f"Image preview too large ({len(image_bytes)} bytes).")
+                return
+
+            lines = render_bw(path) if mode == "bw" else render_braille(path)
+
+            if len(lines) > MAX_IMAGE_LINES:
+                self.post("error", "Image too large to render safely")
+                return
+
+            filename = os.path.basename(path).replace("|", "_")[:MAX_FILENAME] or "image"
+            msg_id = self.generate_msg_id()
+            img_text = "\n".join(lines)
+
+            pending_entry = self.append_chat_entry({
+                "kind": "image",
+                "content": img_text,
+                "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "display": "Me",
+                "color": "green",
+                "alignment": "left",
+                "msg_id": msg_id,
+                "delivered": False,
+            })
+            self.pending_messages[msg_id] = pending_entry
+
+            header = f"{filename}|{mime}|{len(image_bytes)}"
+            writer.write(
+                self.frame_message(
+                    'J',
+                    self.e2e.encrypt(header.encode()),
+                    msg_id=msg_id,
+                )
+            )
+
+            for start in range(0, len(image_bytes), 4096):
+                chunk = image_bytes[start:start + 4096]
+                encoded = base64.b64encode(chunk)
+                writer.write(
+                    self.frame_message(
+                        'G',
+                        self.e2e.encrypt(encoded),
+                        msg_id=msg_id,
+                    )
+                )
+
+            writer.write(self.frame_message('Z', b'', msg_id=msg_id))
+            await writer.drain()
+
+            self.post("success", f"Image sent: {path}")
+
+        except Exception as e:
+            if msg_id is not None:
+                self.pending_messages.pop(msg_id, None)
+            self.post("error", f"Image send failed: {e}")
 
 
     async def send_control(self, signal: str):
@@ -3622,90 +3915,17 @@ class I2PChat(App):
 
 
 
+    def post_help_to_chat(self):
+        for kind, text in HELP_LINES:
+            self.post(kind, text)
+
+
+
     def show_help(self):
-
-        self.post("help_bold", "Command line options:")
-        
-        self.post("help", "")
-        
-        self.post("help", "  Start with --pq [<profile>] to enable HybridPQ encryption. Both peers must use this flag to establish a connection.")
-        self.post("help", "  Start with --reset <profile> to recreate a persistent profile from scratch")
-        self.post("help", "  Start with --delete <profile> to delete a profile completely")
-        self.post("help", "  Start with --wipe-all to remove all app storage completely")
-        
-        self.post("help", "")
-        
-        self.post("help_bold", "Available commands:")
-
-        self.post("help", "")
-
-        self.post("help_bold", "Connection:")
-        
-        self.post("help", "")
-        
-        self.post("help", "  /connect <b32-address>   Connect to peer")
-        self.post("help", "  /disconnect              Close connection")
-        self.post("help", "  /accept                  Accept incoming call")
-        self.post("help", "  /decline                 Decline incoming call")
-
-        self.post("help", "")
-
-        self.post("help_bold", "Messaging:")
-        
-        self.post("help", "")
-        
-        self.post("help", "  Type text and press ENTER to send message")
-        self.post("help", "  /offline                 Enter offline messaging mode (PERSISTENT locked peer only)")
-        self.post("help", "  /online                  Exit offline messaging mode (PERSISTENT locked peer only)")
-        
-        self.post("help", "")
-        
-        self.post("help_bold", "Identity:")
-        
-        self.post("help", "")
-        
-        self.post("help", "  /lock                    Lock persistent profile to current peer (not available in TRANSIENT mode)")
-        
-        self.post("help", "")
-
-        self.post("help_bold", "Files:")
-        
-        self.post("help", "")
-        
-        self.post("help", "  /sendfile <path>         Send file")
-        
-        self.post("help", "")
-
-        self.post("help_bold", "Images:")
-        
-        self.post("help", "")
-        
-        self.post("help", "  /img <path>              Send image (braille renderer)")
-        self.post("help", "  /img-bw <path>           Send image (block renderer for QR / diagrams)")
-        
-        self.post("help", "")
-        
-
-        self.post("help_bold", "Deaddrops:")
-        
-        self.post("help", "")
-        
-        self.post("help", "  /dd-list                 Show known deaddrop servers")
-        self.post("help", "  /dd-add <b32>            Add deaddrop server")
-        self.post("help", "  /dd-del <number>         Remove deaddrop server by list number")
-        self.post("help", "  /dd-share                Share deaddrop server list with peer")
-
-        self.post("help", "")
-
-        self.post("help_bold", "Utility:")
-        
-        self.post("help", "")
-        
-        self.post("help", "  c                        Copy local b32 address to your clipboard")
-        self.post("help", "  /help                    Show this help")
-        self.post("help", "  /CTRL+q                  Exit program")
-        
-        
+        try:
+            self.push_screen(HelpScreen())
+        except Exception:
+            self.post_help_to_chat()
 
 
 
