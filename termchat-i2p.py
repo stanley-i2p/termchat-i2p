@@ -28,6 +28,7 @@ from rich.text import Text
 import time
 import pyperclip
 import base64
+from deaddrop_screens import DeadDropManagerScreen
 from renderer import render_braille, render_bw
 from PIL import Image
 
@@ -40,6 +41,7 @@ from deaddrop import DeadDropClient
 from e2e import E2E
 from file_picker import FilePickerScreen
 from help_screen import HELP_LINES, HelpScreen
+from logs_screen import LogsScreen
 from sam_client import SAMClient
 
 from vault import fs_decrypt, fs_encrypt, fs_runtime_enter, fs_runtime_leave, fs_verify_passphrase
@@ -590,6 +592,7 @@ class I2PChat(App):
         
         self.pending_messages = {}
         self.chat_history = []
+        self.log_history = []
         
         # Command history init
         self.command_history = []
@@ -670,34 +673,34 @@ class I2PChat(App):
         hints = []
 
         if self.pending_incoming_conn:
-            hints = ["/accept", "/decline", "/help"]
+            hints = ["/accept", "/decline", "/logs", "/help"]
 
         elif self.conn and not self.live_ready:
-            hints = ["/disconnect", "/help"]
+            hints = ["/disconnect", "/logs", "/help"]
 
         elif self.conn and self.live_ready:
-            hints = ["/disconnect", "/sendfile", "/img", "/img-bw", "/help"]
+            hints = ["/disconnect", "/sendfile", "/img", "/img-bw", "/logs", "/help"]
 
             if self.is_persistent_mode():
-                hints.extend(["/dd-list", "/dd-add", "/dd-del", "/dd-share"])
+                hints.extend(["/dd", "/dd-share"])
 
             if self.is_persistent_mode() and not self.stored_peer:
                 hints.append("/lock")
 
         elif self.offline_mode:
-            hints = ["/online", "send message", "/help"]
+            hints = ["/online", "send message", "/logs", "/help"]
 
             if self.is_persistent_mode():
-                hints.extend(["/dd-list", "/dd-add", "/dd-del"])
+                hints.append("/dd")
 
         else:
-            hints = ["/connect", "/help"]
+            hints = ["/connect", "/logs", "/help"]
 
             if self.offline_ready():
                 hints.insert(1, "/offline")
 
             if self.is_persistent_mode():
-                hints.extend(["/dd-list", "/dd-add", "/dd-del"])
+                hints.append("/dd")
 
         return "   ".join(hints)
     
@@ -990,10 +993,20 @@ class I2PChat(App):
         self.rerender_chat_history()
 
 
+    def append_log_entry(self, content: str):
+        self.log_history.append(content)
+        return content
+
+
+    def show_logs(self):
+        self.push_screen(LogsScreen(list(self.log_history)))
+
+
     def post(self, type_name: str, message: str, msg_id=None):
         
         styles = {
             "info": "[bold blue]STATUS:[/] [white]{}[/]",
+            "status": "[bold blue]STATUS:[/] [white]{}[/]",
             "error": "[bold red]ERROR:[/] [red]{}[/]",
             #"system": "[bold yellow]SYSTEM:[/] [italic gray]{}[/]",
             "system": "[#878700]SYSTEM:[/] [dim #9f9f9f italic]{}[/]",
@@ -1025,6 +1038,11 @@ class I2PChat(App):
                 "msg_id": msg_id,
                 "delivered": False,
             })
+
+        self.append_log_entry(content)
+
+        if type_name in ("system", "info", "status"):
+            return content
 
         else:
             return self.append_chat_entry({
@@ -2290,12 +2308,14 @@ class I2PChat(App):
 
 
 
-    def show_deaddrop_servers(self):
-        self.post(
-            "system",
-            f"Known deaddrop servers: {len(self.deaddrop_servers)} "
-            f"(active replicas: {len(self.deaddrop.drops)})"
-        )
+    def deaddrop_server_lines(self):
+        lines = [
+            (
+                "bold",
+                f"Known deaddrop servers: {len(self.deaddrop_servers)} "
+                f"(active replicas: {len(self.deaddrop.drops)})",
+            )
+        ]
 
         for i, s in enumerate(self.deaddrop_servers, start=1):
             st = self.deaddrop_stats.get(s, {})
@@ -2306,13 +2326,65 @@ class I2PChat(App):
             latency = st.get("latency_ema_ms", 0.0)
 
             active_tag = " *" if s in self.deaddrop.drops else ""
-            self.post(
-                "system",
+            lines.append((
+                "line",
                 f"  {i}. {s}{active_tag} "
                 f"[put ok/fail={put_ok}/{put_fail} "
                 f"get ok/fail={get_ok}/{get_fail} "
                 f"lat={latency:.1f}ms]"
+            ))
+
+        return lines
+
+
+    def deaddrop_server_rows(self):
+        rows = []
+
+        for i, server in enumerate(self.deaddrop_servers, start=1):
+            st = self.deaddrop_stats.get(server, {})
+            rows.append({
+                "index": i,
+                "server": server,
+                "active": server in self.deaddrop.drops,
+                "put_ok": st.get("put_ok", 0),
+                "put_fail": st.get("put_fail", 0),
+                "get_ok": st.get("get_ok", 0),
+                "get_fail": st.get("get_fail", 0),
+                "latency": st.get("latency_ema_ms", 0.0),
+            })
+
+        return rows
+
+
+    def post_deaddrop_servers_to_chat(self):
+        for _, text in self.deaddrop_server_lines():
+            self.post("system", text)
+
+
+    def show_deaddrop_servers(self):
+        try:
+            self.open_deaddrop_manager()
+        except Exception:
+            self.post_deaddrop_servers_to_chat()
+
+
+    def get_deaddrop_server_by_index(self, index: int) -> str | None:
+        if index < 1 or index > len(self.deaddrop_servers):
+            return None
+        return self.deaddrop_servers[index - 1]
+
+
+    def open_deaddrop_manager(self, add_value: str = "", delete_index: int | None = None):
+        self.push_screen(
+            DeadDropManagerScreen(
+                get_rows=self.deaddrop_server_rows,
+                add_server=self.add_deaddrop_server,
+                delete_server=self.delete_deaddrop_server_by_index,
+                get_server=self.get_deaddrop_server_by_index,
+                add_value=add_value,
+                delete_index=delete_index,
             )
+        )
 
 
     def add_deaddrop_server(self, server: str):
@@ -2746,6 +2818,13 @@ class I2PChat(App):
         
         
         
+        elif msg.strip() == "/dd":
+            if not self.is_persistent_mode():
+                self.post("error", "Deaddrop commands are available only in PERSISTENT mode.")
+                return
+            self.open_deaddrop_manager()
+            return
+
         elif msg.strip() == "/dd-list":
             if not self.is_persistent_mode():
                 self.post("error", "Deaddrop commands are available only in PERSISTENT mode.")
@@ -2753,12 +2832,29 @@ class I2PChat(App):
             self.show_deaddrop_servers()
             return
 
+        elif msg.strip() == "/dd-add":
+            if not self.is_persistent_mode():
+                self.post("error", "Deaddrop commands are available only in PERSISTENT mode.")
+                return
+            self.open_deaddrop_manager()
+            return
+
         elif msg.startswith("/dd-add "):
             if not self.is_persistent_mode():
                 self.post("error", "Deaddrop commands are available only in PERSISTENT mode.")
                 return
             server = msg[len("/dd-add "):].strip()
-            self.add_deaddrop_server(server)
+            if not server:
+                self.open_deaddrop_manager()
+                return
+            self.open_deaddrop_manager(add_value=server)
+            return
+
+        elif msg.strip() == "/dd-del":
+            if not self.is_persistent_mode():
+                self.post("error", "Deaddrop commands are available only in PERSISTENT mode.")
+                return
+            self.open_deaddrop_manager()
             return
 
         elif msg.startswith("/dd-del "):
@@ -2766,9 +2862,12 @@ class I2PChat(App):
                 self.post("error", "Deaddrop commands are available only in PERSISTENT mode.")
                 return
             arg = msg[len("/dd-del "):].strip()
+            if not arg:
+                self.open_deaddrop_manager()
+                return
             try:
                 idx = int(arg)
-                self.delete_deaddrop_server_by_index(idx)
+                self.open_deaddrop_manager(delete_index=idx)
             except ValueError:
                 self.post("error", "Usage: /dd-del <number>")
             return
@@ -2787,6 +2886,10 @@ class I2PChat(App):
         
         elif msg.strip() == "/help":
             self.show_help()
+            return
+
+        elif msg.strip() == "/logs":
+            self.show_logs()
             return
         
                 
