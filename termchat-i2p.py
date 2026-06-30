@@ -29,7 +29,7 @@ import time
 import pyperclip
 import base64
 from deaddrop_screens import DeadDropManagerScreen
-from renderer import render_braille, render_bw
+from renderer import render_braille_color, render_bw
 from PIL import Image
 
 import struct
@@ -56,6 +56,7 @@ MAX_FRAME_SIZE = 256 * 1024      # 256 KB max protocol frame
 MAX_FILE_SIZE = 50 * 1024 * 1024 # 50 MB max file
 MAX_IMAGE_LINES = 2000           # prevents huge ASCII images
 MAX_FILENAME = 128
+IMAGE_RENDER_WIDTH = 60
 IMAGE_TRANSFER_MAX_DIMENSION = 1280
 IMAGE_TRANSFER_JPEG_QUALITY = 82
 
@@ -960,8 +961,10 @@ class I2PChat(App):
             if entry.get("msg_id") is not None and entry.get("delivered"):
                 delivery = " [dim green]✓✓[/]"
 
+            image_content = Text.from_markup(entry["content"]) if entry.get("markup") else Text(entry["content"], style="bright_white")
+
             message_panel = Panel(
-                entry["content"],
+                image_content,
                 title=f"[#5f5f5f][{entry['timestamp']} UTC][/] [bold {entry['color']}]{entry['display']}[/]{delivery}",
                 title_align="left",
                 border_style=entry["color"],
@@ -1226,7 +1229,7 @@ class I2PChat(App):
             except:
                 pass
 
-            lines = render_bw(tmp_path) if mode == "bw" else render_braille(tmp_path)
+            lines = render_bw(tmp_path, width=IMAGE_RENDER_WIDTH) if mode == "bw" else render_braille_color(tmp_path, width=IMAGE_RENDER_WIDTH)
             if len(lines) > MAX_IMAGE_LINES:
                 raise RuntimeError("Image too large to render safely")
             return "\n".join(lines)
@@ -3284,6 +3287,7 @@ class I2PChat(App):
                     "display": "Peer",
                     "color": "cyan",
                     "alignment": "right",
+                    "markup": True,
                 })
 
                 self.clear_incoming_image_state()
@@ -3694,7 +3698,10 @@ class I2PChat(App):
                 self.post("error", f"Image preview too large ({len(image_bytes)} bytes).")
                 return
 
-            lines = render_bw(path) if mode == "bw" else render_braille(path)
+            if mode == "bw":
+                lines = render_bw(path, width=IMAGE_RENDER_WIDTH)
+            else:
+                lines = render_braille_color(path, width=IMAGE_RENDER_WIDTH)
 
             if len(lines) > MAX_IMAGE_LINES:
                 self.post("error", "Image too large to render safely")
@@ -3713,6 +3720,7 @@ class I2PChat(App):
                 "alignment": "left",
                 "msg_id": msg_id,
                 "delivered": False,
+                "markup": mode != "bw",
             })
             self.pending_messages[msg_id] = pending_entry
 

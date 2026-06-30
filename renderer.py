@@ -2,6 +2,7 @@ import base64
 import os
 from PIL import Image
 from PIL import ImageOps
+from PIL import ImageFilter
 
 
 # Terminal capability detection. Implement later if needed.
@@ -109,15 +110,15 @@ def render_braille(path, width=70):
     # contrast normalization :)
     img = ImageOps.autocontrast(img)
 
-    # Floyd–Steinberg dithering. Needs work.
-    #img = img.convert("1", dither=Image.FLOYDSTEINBERG).convert("L")
+    img = img.filter(ImageFilter.SHARPEN)
 
     w, h = img.size
     ratio = h / w
 
     height = int(width * ratio * 0.5)
 
-    img = img.resize((width * 2, height * 4))
+    img = img.resize((width * 2, height * 4), Image.Resampling.LANCZOS)
+    img = img.convert("1", dither=Image.FLOYDSTEINBERG)
     px = img.load()
 
     lines = []
@@ -133,7 +134,7 @@ def render_braille(path, width=70):
             for dy in range(4):
                 for dx in range(2):
 
-                    if px[x + dx, y + dy] < 128:
+                    if px[x + dx, y + dy] != 0:
 
                         bit = [
                             [0, 3],
@@ -145,6 +146,75 @@ def render_braille(path, width=70):
                         dots |= 1 << bit
 
             line += chr(0x2800 + dots)
+
+        lines.append(line)
+
+    return lines
+
+
+
+def render_braille_color(path, width=70):
+
+    source = Image.open(path).convert("RGB")
+    gray = source.convert("L")
+    gray = ImageOps.autocontrast(gray)
+    gray = gray.filter(ImageFilter.SHARPEN)
+
+    w, h = gray.size
+    ratio = h / w
+
+    height = int(width * ratio * 0.5)
+
+    color_img = source.resize((width * 2, height * 4), Image.Resampling.LANCZOS)
+    mask = gray.resize((width * 2, height * 4), Image.Resampling.LANCZOS)
+    mask = mask.convert("1", dither=Image.FLOYDSTEINBERG)
+
+    color_px = color_img.load()
+    mask_px = mask.load()
+
+    lines = []
+
+    for y in range(0, height * 4, 4):
+
+        line = ""
+
+        for x in range(0, width * 2, 2):
+
+            dots = 0
+            red = 0
+            green = 0
+            blue = 0
+            samples = 0
+
+            for dy in range(4):
+                for dx in range(2):
+
+                    if mask_px[x + dx, y + dy] != 0:
+
+                        bit = [
+                            [0, 3],
+                            [1, 4],
+                            [2, 5],
+                            [6, 7],
+                        ][dy][dx]
+
+                        dots |= 1 << bit
+
+                        r, g, b = color_px[x + dx, y + dy]
+                        red += r
+                        green += g
+                        blue += b
+                        samples += 1
+
+            char = chr(0x2800 + dots)
+
+            if samples:
+                red //= samples
+                green //= samples
+                blue //= samples
+                line += f"[#{red:02x}{green:02x}{blue:02x}]{char}[/]"
+            else:
+                line += char
 
         lines.append(line)
 
