@@ -40,6 +40,29 @@ import json
 from deaddrop import DeadDropClient
 from e2e import E2E
 from file_picker import FilePickerScreen
+from group_ops import (
+    GROUP_CONTROL_JOIN_PROOF,
+    GROUP_CONTROL_RENAME_REQUEST,
+    GroupRuntimeLock,
+    GroupStore,
+    build_group_control,
+    compact_json_bytes,
+    decode_group_invite_string,
+    group_is_admin,
+    group_runtime_is_locked,
+    group_self_display_name,
+    group_storage_key,
+    issue_group_invite,
+    make_group_meta,
+    merge_group_invite,
+    merge_group_member,
+    merge_group_roster_sync,
+    normalize_member,
+    redeem_group_invite_token,
+    roster_sync_from_meta,
+    sign_group_roster_if_admin,
+)
+from group_screens import ActiveGroupScreen, GroupManagerScreen
 from help_screen import HELP_LINES, HelpScreen
 from logs_screen import LogsScreen
 from sam_client import SAMClient
@@ -287,6 +310,8 @@ def print_help():
     print("")
     print("Usage:")
     print("  termchat-i2p [profile_name] [--pq]")
+    print("  termchat-i2p --groups")
+    print("  termchat-i2p --group <group_name_or_key>")
     print("  termchat-i2p --help")
     print("  termchat-i2p --wipe-all")
     print("  termchat-i2p --reset <profile_name>")
@@ -297,9 +322,13 @@ def print_help():
     print("Modes:")
     print("  no profile name      Start in TRANSIENT mode")
     print("  profile_name         Start/Use a PERSISTENT profile")
+    print("  --groups            Open group workspace")
+    print("  --group <group>     Open one dedicated group chat")
     print("")
     print("Options:")
     print("  --pq                Enable post-quantum hybrid mode")
+    print("  --groups            Manage groups and open one group chat")
+    print("  --group <group>     Start a dedicated group chat session")
     print("  --help              Show this help and exit")
     print("  --wipe-all          Remove all application data")
     print("  --reset <profile>   Reset one persistent profile")
@@ -332,6 +361,8 @@ WIPE_ALL = False
 EXPORT_VAULT = False
 IMPORT_VAULT = False
 PQ_ENABLED = False
+APP_MODE = "contact"
+GROUP_SELECTOR = None
 EXPORT_PATH = None
 IMPORT_PATH = None
 
@@ -350,6 +381,23 @@ if "--pq" in raw_args:
 if len(raw_args) > 0 and raw_args[0] == "--wipe-all":
     WIPE_ALL = True
     PROFILE_NAME = "default"
+
+elif len(raw_args) == 1 and raw_args[0] == "--groups":
+    APP_MODE = "groups"
+    PROFILE_NAME = "default"
+
+elif len(raw_args) == 2 and raw_args[0] == "--group":
+    APP_MODE = "group"
+    GROUP_SELECTOR = raw_args[1].strip()
+    if not GROUP_SELECTOR:
+        print("[ERROR] --group requires a group name or key.")
+        sys.exit(1)
+    PROFILE_NAME = "default"
+
+elif len(raw_args) > 0 and raw_args[0] in ("--groups", "--group"):
+    print("[ERROR] Invalid group mode arguments.")
+    print("Use --help to see available options.")
+    sys.exit(1)
 
 elif len(raw_args) > 1 and raw_args[0] == "--reset":
     RESET_PROFILE = True
@@ -455,8 +503,8 @@ if RESET_PROFILE and os.path.exists(PROFILE_DIR):
         shutil.rmtree(PROFILE_DIR, ignore_errors=True)
 
 
-secure_makedirs(PROFILE_DIR)
-secure_makedirs(PROFILE_DIR)
+if APP_MODE == "contact" or RESET_PROFILE or DELETE_PROFILE:
+    secure_makedirs(PROFILE_DIR)
 secure_makedirs(IMAGE_DIR)
 secure_makedirs(FILE_DIR)
 secure_makedirs(BLOB_DIR)
@@ -531,6 +579,8 @@ class I2PChat(App):
 
     def __init__(self):
         super().__init__()
+        self.app_mode = APP_MODE
+        self.group_selector = GROUP_SELECTOR
         self.sam_address = ('127.0.0.1', 7656)
         self.sock = None  # LISTENER
         self.conn = None  # ACTIVE CHAT
@@ -594,6 +644,17 @@ class I2PChat(App):
         self.pending_messages = {}
         self.chat_history = []
         self.log_history = []
+
+        self.group_store = GroupStore(BASE_DIR)
+        self.active_group_key = None
+        self.active_group = None
+        self.group_sam = None
+        self.group_session_id = None
+        self.group_pub_dest_b64 = None
+        self.group_accept_task = None
+        self.group_peers = {}
+        self.group_pending_messages = {}
+        self.group_runtime_lock = None
         
         # Command history init
         self.command_history = []
@@ -673,7 +734,19 @@ class I2PChat(App):
     def get_command_hints(self) -> str:
         hints = []
 
-        if self.pending_incoming_conn:
+        if self.app_mode == "groups" and self.active_group:
+            hints = ["/group", "/disconnect", "/log", "/help"]
+
+        elif self.app_mode == "groups":
+            hints = ["/admin", "/log", "/help"]
+
+        elif self.app_mode == "group":
+            hints = ["/group", "/disconnect", "/log", "/help"]
+
+        elif self.active_group:
+            hints = ["/group", "/disconnect", "/log", "/help"]
+
+        elif self.pending_incoming_conn:
             hints = ["/accept", "/decline", "/logs", "/help"]
 
         elif self.conn and not self.live_ready:
@@ -725,6 +798,63 @@ class I2PChat(App):
             "local_ok": ("[yellow]●[/]", "BUILDING TUNNELS", "yellow"),
             "visible": ("[green]●[/]", "VISIBLE / READY", "green")
         }
+
+        if self.app_mode in ("groups", "group"):
+            dot, status_text, border_col = status_map.get(self.network_status, status_map["initializing"])
+            grid = Table.grid(expand=True)
+            grid.add_column(justify="left", ratio=1)
+            grid.add_column(justify="center", ratio=1)
+            grid.add_column(justify="right", ratio=1)
+
+            if self.active_group:
+                group_name = self.active_group.get("name") or "group"
+                my_name = group_self_display_name(self.active_group).upper()
+                my_group_b32 = self.active_group.get("my_b32") or ""
+                clean_group_b32 = my_group_b32.replace(".b32.i2p", "")
+                if clean_group_b32:
+                    group_b32_display = f"{clean_group_b32[:6]}...{clean_group_b32[-6:]}"
+                else:
+                    group_b32_display = "----"
+
+                ready_count = sum(
+                    1
+                    for peer in self.group_peers.values()
+                    if peer.get("ready") and peer.get("authorized")
+                )
+                peer_count = len(self.active_group.get("members") or [])
+                is_active = ready_count > 0
+                border_col = "cyan" if is_active else "yellow"
+                title = "ACTIVE SESSION" if is_active else "TUNNELS READY"
+                conn_viz = "[bold cyan]o[/] [dim]CONNECTED[/]" if is_active else f"[dim]{dot} [dim]STANDBY[/]"
+                left_content = (
+                    f"[black on green] [bold]P[/] [/] "
+                    f"[black on green] [bold]G[/] [/] "
+                    f"[bold]{escape(my_name)}[/] [dim]#{escape(group_name)}[/]"
+                )
+                right_content = f"[green]{group_b32_display}[/] [white]:[/] [cyan dim]{ready_count}/{peer_count} active[/]"
+            else:
+                groups_count = len(self.group_store.list_groups())
+                left_content = "[black on green] [bold]G[/] [/] [bold]GROUPS[/]"
+                conn_viz = f"[dim]{dot} [dim]STANDBY[/]"
+                right_content = f"[cyan]{groups_count}[/] groups"
+                title = "TUNNELS READY"
+
+            grid.add_row(left_content, conn_viz, right_content)
+            status_panel = Panel(
+                grid,
+                title=f"[bold {border_col}]{title}[/]",
+                border_style=border_col,
+                box=box.ROUNDED,
+                style="default"
+            )
+
+            try:
+                self.query_one("#status_bar").update(status_panel)
+            except:
+                pass
+
+            self.update_command_bar()
+            return
     
         dot, _, _ = status_map.get(self.network_status, status_map["initializing"])
     
@@ -973,6 +1103,32 @@ class I2PChat(App):
             )
 
             return Align(message_panel, align=entry["alignment"]), True
+
+        if entry.get("kind") == "group_bubble":
+            formatted_msg = self.format_chat_message(entry["message"])
+            mine = bool(entry.get("mine"))
+            box_color = "green" if mine else "cyan"
+            display_name = "Me" if mine else entry.get("author", "Group")
+            alignment = "left" if mine else "right"
+
+            delivery = ""
+            if mine:
+                expected = entry.get("group_expected_acks") or []
+                received = entry.get("group_received_acks") or []
+                if expected:
+                    mark = "✓✓" if len(received) >= len(expected) else "✓"
+                    delivery = f" [dim green]{mark} {len(received)}/{len(expected)}[/]"
+
+            message_panel = Panel(
+                f"[white]{formatted_msg}[/]",
+                title=f"[#5f5f5f][{entry['timestamp']} UTC][/] [bold {box_color}]{display_name}[/]{delivery}",
+                title_align="left",
+                border_style=box_color,
+                box=box.ROUNDED,
+                expand=False
+            )
+
+            return Align(message_panel, align=alignment), True
 
         return entry["content"], False
 
@@ -1252,6 +1408,10 @@ class I2PChat(App):
 
     def peer_dest_fingerprint(self, dest_b64: str) -> str:
         return hashlib.sha256(dest_b64.encode()).hexdigest()[:16]
+
+
+    def sam_session_label(self, profile_name: str) -> str:
+        return "".join(ch if ch.isalnum() else "_" for ch in profile_name)
 
 
     def peer_dest_matches_tofu(self, dest_b64: str) -> bool:
@@ -2432,6 +2592,14 @@ class I2PChat(App):
     async def on_mount(self):
         
         self.chat_log = self.query_one("#chat_window", RichLog)
+
+        if self.app_mode == "groups":
+            await self.on_mount_group_manager()
+            return
+
+        if self.app_mode == "group":
+            await self.on_mount_group_chat()
+            return
         
         self.network_status = "initializing"
         
@@ -2594,6 +2762,72 @@ class I2PChat(App):
         self.command_history_current_buffer = ""
         event.input.value = ""
 
+        if self.app_mode == "groups":
+            if self.active_group:
+                if msg.strip() == "/disconnect":
+                    await self.close_group()
+                    self.network_status = "visible"
+                    self.peer_b32 = "Group Manager"
+                    self.post("system", "Returned to group manager mode.")
+                    return
+
+                if msg.strip() == "/group":
+                    self.open_active_group_screen()
+                    return
+
+                if msg.strip() in ("/log", "/logs"):
+                    self.show_logs()
+                    return
+
+                if msg.strip() == "/help":
+                    self.show_help()
+                    return
+
+                if msg.startswith("/"):
+                    self.post("error", "Group chat supports /group, /disconnect, /log, and /help.")
+                    return
+
+                await self.send_group_message(msg)
+                return
+
+            if msg.strip() == "/admin":
+                self.open_group_manager()
+            elif msg.strip() in ("/log", "/logs"):
+                self.show_logs()
+            elif msg.strip() == "/help":
+                self.show_help()
+            else:
+                self.post("error", "Group manager mode supports /admin, /log, and /help.")
+            return
+
+        if self.app_mode == "group":
+            if msg.strip() == "/disconnect":
+                await self.close_group()
+                self.exit()
+                return
+
+            if msg.strip() == "/group":
+                self.open_active_group_screen()
+                return
+
+            if msg.strip() in ("/log", "/logs"):
+                self.show_logs()
+                return
+
+            if msg.strip() == "/help":
+                self.show_help()
+                return
+
+            if msg.startswith("/"):
+                self.post("error", "This is group chat mode. Use /group, /disconnect, /log, or /help.")
+                return
+
+            if self.active_group:
+                await self.send_group_message(msg)
+            else:
+                self.post("error", "Group is not ready.")
+            return
+
 
         if msg.strip() == "/accept":
             await self.accept_pending_incoming()
@@ -2641,6 +2875,18 @@ class I2PChat(App):
             self.leave_offline_mode()
             self.update_command_bar()
             self.post("system", "Returned to normal standby mode.")
+            return
+
+        if msg.strip() == "/group":
+            self.post("system", "Use --groups for group administration, or --group <group> to start group chat.")
+            return
+
+        if msg.strip() in ("/groups", "/group-list"):
+            self.post("system", "Use --groups for group administration.")
+            return
+
+        if msg.startswith("/group"):
+            self.post("system", "Use --groups for group management, or --group <group> for group chat.")
             return
 
 
@@ -2901,6 +3147,10 @@ class I2PChat(App):
                 self.post("error", "Incoming call is pending. Use /decline instead.")
                 return
             self.run_worker(self.disconnect_peer())
+
+
+        elif self.active_group:
+            await self.send_group_message(msg)
             
             
         elif self.conn and self.live_ready:
@@ -3559,6 +3809,18 @@ class I2PChat(App):
              
         elif msg_type == 'L':
             try:
+                stripped = body.strip()
+                if stripped.startswith("{"):
+                    data = json.loads(stripped)
+                    data_format = data.get("format")
+                    data_kind = data.get("kind")
+                    if data_format in ("icedcomm-i2p-group-roster", "icedcomm-i2p-group-invite"):
+                        self.post("system", "Received group payload on direct chat; open a group session to process group rosters.")
+                        return
+                    if data_kind in (GROUP_CONTROL_JOIN_PROOF, GROUP_CONTROL_RENAME_REQUEST):
+                        self.post("system", "Received group control payload on direct chat; ignoring outside group session.")
+                        return
+
                 servers = [line.strip() for line in body.splitlines() if line.strip()]
                 if not servers:
                     return
@@ -3580,6 +3842,976 @@ class I2PChat(App):
                 await writer.drain()
 
 
+    def show_group_list(self):
+        groups = self.group_store.list_groups()
+        if not groups:
+            self.post("system", "No groups. Use /group-create <group name> | <your name> or /group-join <invite> <your name>.")
+            return
+
+        self.post("system", "Groups:")
+        for meta in groups:
+            key = group_storage_key(meta)
+            status = "open" if self.active_group_key == key else "closed"
+            member_count = len(meta.get("members") or [])
+            self.post("system", f"{meta.get('name', 'group')} [{key[:12]}...] {member_count} members, {status}")
+
+
+    async def on_mount_group_manager(self):
+        self.network_status = "visible"
+        self.peer_b32 = "Group Manager"
+        self.post("system", f"{APP_NAME} {APP_VERSION}")
+        self.post("system", "Mode: GROUP MANAGER")
+        self.post("system", "No contact session is active.")
+        self.show_group_list()
+        self.open_group_manager()
+        self.update_command_bar()
+
+
+    async def on_mount_group_chat(self):
+        self.network_status = "initializing"
+        self.peer_b32 = "Initializing group..."
+        self.post("system", f"{APP_NAME} {APP_VERSION}")
+        self.post("system", "Mode: GROUP CHAT")
+        self.post("system", f"Group selector: {self.group_selector}")
+        await self.open_group(self.group_selector, acquire_lock=True)
+        self.update_command_bar()
+
+
+    def group_manager_rows(self) -> list[dict]:
+        rows = []
+        for index, meta in enumerate(self.group_store.list_groups(), start=1):
+            key = group_storage_key(meta)
+            owner = meta.get("owner_b32") or ""
+            is_active = key == self.active_group_key
+            is_locked = False if is_active else group_runtime_is_locked(self.group_store, key)
+            rows.append({
+                "index": index,
+                "active": is_active,
+                "state": "OPEN" if is_active else ("LOCKED" if is_locked else "READY"),
+                "name": meta.get("name") or "group",
+                "members": len(meta.get("members") or []),
+                "owner": owner[:12] + "..." if owner else "",
+                "key": key,
+            })
+        return rows
+
+
+    def open_group_manager(self):
+        if self.app_mode == "contact":
+            self.post("system", "Use --groups to manage groups outside contact chat.")
+            return
+
+        if self.active_group:
+            self.open_active_group_screen()
+            return
+
+        active_name = group_self_display_name(self.active_group) if self.active_group else ""
+
+        self.push_screen(
+            GroupManagerScreen(
+                get_rows=self.group_manager_rows,
+                open_group=self.open_group_from_manager,
+                create_group=self.create_group_record,
+                join_group=self.join_group_record,
+                issue_invite=self.issue_group_invite_for_key,
+                delete_group=self.delete_group_record,
+                rename_me=lambda name: self.run_worker(self.rename_in_group(name)),
+                active_group_key=self.active_group_key,
+                active_group_open=self.active_group is not None,
+                active_group_owner=group_is_admin(self.active_group) if self.active_group else False,
+                active_display_name=active_name,
+            )
+        )
+
+
+    def active_group_member_rows(self) -> list[dict]:
+        if not self.active_group:
+            return []
+
+        rows = []
+        my_b32 = (self.active_group.get("my_b32") or "").lower()
+        owner_b32 = (self.active_group.get("owner_b32") or "").lower()
+
+        if my_b32:
+            rows.append({
+                "role": "OWNER" if my_b32 == owner_b32 else "ME",
+                "state": "LOCAL",
+                "name": group_self_display_name(self.active_group),
+                "b32": my_b32,
+            })
+
+        for member in self.active_group.get("members") or []:
+            normalized = normalize_member(member)
+            b32 = normalized["b32"].lower()
+            if b32 == my_b32:
+                continue
+            peer = self.group_peers.get(b32) or {}
+            rows.append({
+                "role": "OWNER" if b32 == owner_b32 else "MEMBER",
+                "state": "READY" if peer.get("ready") and peer.get("authorized") else "OFFLINE",
+                "name": normalized["name"],
+                "b32": b32,
+            })
+
+        return rows
+
+
+    def open_active_group_screen(self):
+        if not self.active_group:
+            self.post("error", "No group is open.")
+            return
+
+        self.push_screen(
+            ActiveGroupScreen(
+                group_name=self.active_group.get("name") or "group",
+                is_owner=group_is_admin(self.active_group),
+                get_rows=self.active_group_member_rows,
+                rename_me=lambda name: self.run_worker(self.rename_in_group(name)),
+                issue_invite=lambda: self.issue_group_invite_for_key(self.active_group_key),
+                remove_member=lambda b32: self.run_worker(self.remove_group_member(b32)),
+                display_name=group_self_display_name(self.active_group),
+            )
+        )
+
+
+    def open_group_from_manager(self, key: str):
+        if self.active_group:
+            self.post("error", "Close the current group before opening another one.")
+            return
+        if group_runtime_is_locked(self.group_store, key):
+            self.post("error", "Group is already open in another instance.")
+            return
+        self.run_worker(self.open_group(key, acquire_lock=True))
+
+
+    def show_group_start_command(self, key: str):
+        meta = self.group_store.find(key)
+        if not meta:
+            self.post("error", "Group not found.")
+            return
+        resolved_key = group_storage_key(meta)
+        self.post("system", f"Start group chat with: {os.path.basename(sys.argv[0])} --group {resolved_key}")
+
+
+    def create_group_record(self, group_name: str, my_name: str = ""):
+        try:
+            meta = make_group_meta(group_name, my_name)
+            key = self.group_store.save(meta)
+            self.post("success", f"Created group: {meta.get('name', 'group')}")
+            self.post("system", f"Start once to initialize group identity: {os.path.basename(sys.argv[0])} --group {key}")
+        except Exception as e:
+            self.post("error", f"Group create failed: {e}")
+
+
+    def join_group_record(self, invite_text: str, my_name: str):
+        try:
+            invite = decode_group_invite_string(invite_text)
+            meta = make_group_meta(invite.get("group_name") or "group", my_name)
+            merge_group_invite(meta, invite)
+            key = self.group_store.save(meta)
+            self.post("success", f"Joined group record: {meta.get('name', 'group')}")
+            self.post("system", f"Start group chat with: {os.path.basename(sys.argv[0])} --group {key}")
+        except Exception as e:
+            self.post("error", f"Group join failed: {e}")
+
+
+    def delete_group_record(self, key: str):
+        try:
+            meta = self.group_store.find(key)
+            if not meta:
+                self.post("error", "Group not found.")
+                return
+            resolved_key = group_storage_key(meta)
+            if self.active_group_key == resolved_key:
+                self.post("error", "Cannot delete an active group.")
+                return
+            if group_runtime_is_locked(self.group_store, resolved_key):
+                self.post("error", "Cannot delete group while it is open in another instance.")
+                return
+            lock = GroupRuntimeLock(self.group_store, resolved_key)
+            try:
+                lock.acquire()
+            except Exception:
+                self.post("error", "Cannot delete group while it is open in another instance.")
+                return
+            try:
+                self.group_store.delete_key(resolved_key)
+                self.post("success", f"Deleted group: {meta.get('name', resolved_key)}")
+            finally:
+                try:
+                    lock.release()
+                except:
+                    pass
+        except Exception as e:
+            self.post("error", f"Group delete failed: {e}")
+
+
+    def issue_group_invite_for_key(self, key: str | None = None) -> str | None:
+        if key:
+            meta = self.group_store.find(key)
+        else:
+            meta = self.active_group
+
+        if not meta:
+            self.post("error", "No group selected.")
+            return None
+
+        try:
+            updated, invite = issue_group_invite(meta)
+            if self.active_group and group_storage_key(self.active_group) == group_storage_key(updated):
+                self.active_group = updated
+                self.active_group_key = self.group_store.save(updated)
+            else:
+                self.group_store.save(updated)
+            self.post("success", "Group invite:")
+            try:
+                pyperclip.copy(invite)
+                self.post("success", "Group invite copied to system clipboard.")
+            except Exception as e:
+                self.post("error", f"Clipboard copy failed: {e}")
+            self.post("system", invite)
+            return invite
+        except Exception as e:
+            self.post("error", f"Group invite failed: {e}")
+            return None
+
+
+    def show_group_members(self):
+        if not self.active_group:
+            self.post("error", "No group is open. Use /group-open <name-or-key>.")
+            return
+
+        self.post("system", f"Group members for {self.active_group.get('name', 'group')}:")
+        my_b32 = (self.active_group.get("my_b32") or "").lower()
+        owner_b32 = (self.active_group.get("owner_b32") or "").lower()
+
+        if my_b32:
+            label = group_self_display_name(self.active_group)
+            suffix = " owner" if my_b32 == owner_b32 else " me"
+            self.post("system", f"{label}: {my_b32}{suffix}")
+
+        for member in self.active_group.get("members") or []:
+            b32 = (member.get("b32") or "").lower()
+            if b32 == my_b32:
+                continue
+            peer = self.group_peers.get(b32) or {}
+            state = "ready" if peer.get("ready") and peer.get("authorized") else "offline"
+            suffix = " owner" if b32 == owner_b32 else ""
+            self.post("system", f"{member.get('name', 'member')}: {b32} [{state}]{suffix}")
+
+
+    async def create_group(self, group_name: str, my_name: str = ""):
+        try:
+            meta = make_group_meta(group_name, my_name)
+            self.group_store.save(meta)
+            await self.open_group(group_storage_key(meta))
+        except Exception as e:
+            self.post("error", f"Group create failed: {e}")
+
+
+    async def join_group(self, invite_text: str, my_name: str):
+        try:
+            invite = decode_group_invite_string(invite_text)
+            meta = make_group_meta(invite.get("group_name") or "group", my_name)
+            merge_group_invite(meta, invite)
+            self.group_store.save(meta)
+            await self.open_group(group_storage_key(meta))
+        except Exception as e:
+            self.post("error", f"Group join failed: {e}")
+
+
+    async def open_group(self, selector: str, acquire_lock: bool = False):
+        meta = self.group_store.find(selector)
+        if not meta:
+            self.post("error", "Group not found.")
+            if acquire_lock:
+                self.exit()
+            return
+        old_key = group_storage_key(meta)
+
+        await self.close_group(quiet=True)
+
+        try:
+            if acquire_lock:
+                self.group_runtime_lock = GroupRuntimeLock(self.group_store, old_key)
+                self.group_runtime_lock.acquire()
+
+            self.group_sam = SAMClient(self.sam_address[0], self.sam_address[1])
+            await self.group_sam.connect()
+
+            if not meta.get("my_dest_b64"):
+                self.post("system", "Generating group identity...")
+                group_pub_dest_b64, group_dest_b64 = await self.group_sam.generate_destination(sig_type=7)
+                meta["my_dest_b64"] = group_dest_b64
+                self.group_pub_dest_b64 = group_pub_dest_b64
+
+            group_profile_name = f"group:{group_storage_key(meta)}"
+            self.group_session_id = f"chat_{self.sam_session_label(group_profile_name)}_{int(time.time())}"
+            await self.group_sam.create_session(
+                self.group_session_id,
+                destination=meta["my_dest_b64"],
+                options={
+                    "inbound.length": "2",
+                    "outbound.length": "2",
+                    "inbound.quantity": "3",
+                    "outbound.quantity": "3"
+                }
+            )
+
+            self.group_pub_dest_b64 = await self.group_sam.naming_lookup("ME")
+            my_b32 = self.group_sam.destination_to_b32(self.group_pub_dest_b64)
+            meta["my_b32"] = my_b32
+
+            if not meta.get("owner_b32"):
+                meta["owner_b32"] = my_b32
+                meta["id"] = my_b32
+
+            if group_is_admin(meta):
+                sign_group_roster_if_admin(meta)
+
+            key = self.group_store.save(meta)
+            if old_key != key:
+                self.group_store.delete_key(old_key)
+                if self.group_runtime_lock:
+                    self.group_runtime_lock.release()
+                    self.group_runtime_lock = GroupRuntimeLock(self.group_store, key)
+                    self.group_runtime_lock.acquire()
+            self.active_group_key = key
+            self.active_group = meta
+            self.group_peers = {}
+            self.group_pending_messages = {}
+
+            self.post("success", f"Opened group: {meta.get('name', 'group')}")
+            self.post("system", f"Group address: {my_b32}")
+            self.network_status = "local_ok"
+            self.peer_b32 = f"Group: {meta.get('name', 'group')}"
+            self.watch_peer_b32(self.peer_b32)
+
+            self.group_accept_task = asyncio.create_task(self.group_accept_loop(key))
+            await self.connect_group_members()
+            self.update_command_bar()
+        except Exception as e:
+            await self.close_group(quiet=True)
+            self.post("error", f"Group open failed: {e}")
+            if acquire_lock:
+                self.exit()
+
+
+    async def close_group(self, quiet: bool = False):
+        if self.group_accept_task:
+            self.group_accept_task.cancel()
+            try:
+                await self.group_accept_task
+            except:
+                pass
+            self.group_accept_task = None
+
+        for peer in list(self.group_peers.values()):
+            task = peer.get("task")
+            if task:
+                task.cancel()
+            heartbeat_task = peer.get("heartbeat_task")
+            if heartbeat_task:
+                heartbeat_task.cancel()
+            writer = peer.get("writer")
+            if writer is not None:
+                try:
+                    if peer.get("ready"):
+                        writer.write(self.frame_message("S", "__SIGNAL__:QUIT"))
+                        await writer.drain()
+                except:
+                    pass
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except:
+                    pass
+
+        if self.group_sam:
+            try:
+                await self.group_sam.close()
+            except:
+                pass
+
+        if self.group_runtime_lock:
+            try:
+                self.group_runtime_lock.release()
+            except:
+                pass
+            self.group_runtime_lock = None
+
+        closed_name = self.active_group.get("name", "group") if self.active_group else "group"
+        self.active_group_key = None
+        self.active_group = None
+        self.group_sam = None
+        self.group_session_id = None
+        self.group_pub_dest_b64 = None
+        self.group_peers = {}
+        self.group_pending_messages = {}
+        if self.app_mode == "groups":
+            self.network_status = "visible"
+            self.peer_b32 = "Group Manager"
+            self.watch_peer_b32(self.peer_b32)
+        self.update_command_bar()
+
+        if not quiet:
+            self.post("system", f"Closed group: {closed_name}")
+
+
+    def issue_active_group_invite(self):
+        self.issue_group_invite_for_key(self.active_group_key)
+
+
+    async def rename_in_group(self, name: str):
+        if not self.active_group:
+            self.post("error", "No group is open. Use /group-open <name-or-key>.")
+            return
+        if not name:
+            self.post("error", "Usage: /group-name <your-name>")
+            return
+
+        self.active_group["my_name"] = name[:32]
+        if group_is_admin(self.active_group):
+            sign_group_roster_if_admin(self.active_group)
+            self.group_store.save(self.active_group)
+            await self.send_group_roster_sync_to_ready_peers()
+        else:
+            self.group_store.save(self.active_group)
+            await self.send_group_join_or_rename_to_owner()
+
+        self.post("success", f"Group display name set to {self.active_group['my_name']}.")
+
+
+    async def remove_group_member(self, member_b32: str):
+        if not self.active_group:
+            self.post("error", "No group is open.")
+            return
+
+        if not group_is_admin(self.active_group):
+            self.post("error", "Only the group owner can remove members.")
+            return
+
+        member_b32 = (member_b32 or "").strip().lower()
+        my_b32 = (self.active_group.get("my_b32") or "").lower()
+        owner_b32 = (self.active_group.get("owner_b32") or "").lower()
+
+        if not member_b32:
+            self.post("error", "No member selected.")
+            return
+
+        if member_b32 == my_b32:
+            self.post("error", "Cannot remove yourself from your own open group.")
+            return
+
+        if member_b32 == owner_b32:
+            self.post("error", "Cannot remove the group owner.")
+            return
+
+        members = self.active_group.get("members") or []
+        remaining = [
+            member
+            for member in members
+            if (member.get("b32") or "").lower() != member_b32
+        ]
+
+        if len(remaining) == len(members):
+            self.post("error", "Selected member is not in the roster.")
+            return
+
+        peer = self.group_peers.get(member_b32)
+        if peer:
+            writer = peer.get("writer")
+            if writer is not None:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except:
+                    pass
+            task = peer.get("task")
+            if task:
+                try:
+                    task.cancel()
+                except:
+                    pass
+            heartbeat_task = peer.get("heartbeat_task")
+            if heartbeat_task:
+                try:
+                    heartbeat_task.cancel()
+                except:
+                    pass
+            self.group_peers.pop(member_b32, None)
+
+        self.active_group["members"] = remaining
+        self.active_group["roster_version"] = int(self.active_group.get("roster_version") or 1) + 1
+        sign_group_roster_if_admin(self.active_group)
+        self.group_store.save(self.active_group)
+        await self.send_group_roster_sync_to_ready_peers()
+        self.watch_peer_b32(self.peer_b32)
+        self.post("success", f"Removed group member: {member_b32}")
+
+
+    def group_member_by_b32(self, b32: str):
+        if not self.active_group:
+            return None
+        b32_l = b32.lower()
+        if (self.active_group.get("my_b32") or "").lower() == b32_l:
+            return {"name": group_self_display_name(self.active_group), "b32": b32_l}
+        for member in self.active_group.get("members") or []:
+            if (member.get("b32") or "").lower() == b32_l:
+                return normalize_member(member)
+        return None
+
+
+    def ensure_group_peer(self, member: dict, authorized: bool = True):
+        normalized = normalize_member(member)
+        b32 = normalized["b32"].lower()
+        peer = self.group_peers.get(b32)
+        if peer:
+            peer["member"] = normalized
+            peer["authorized"] = peer.get("authorized", False) or authorized
+            return peer
+
+        peer = {
+            "member": normalized,
+            "authorized": authorized,
+            "ready": False,
+            "e2e": E2E(pq_enabled=False),
+            "reader": None,
+            "writer": None,
+            "task": None,
+            "heartbeat_task": None,
+            "heartbeat_last_rx_ts": 0.0,
+            "heartbeat_last_ping_ts": 0.0,
+        }
+        self.group_peers[b32] = peer
+        return peer
+
+
+    async def connect_group_members(self):
+        if not self.active_group:
+            return
+
+        my_b32 = (self.active_group.get("my_b32") or "").lower()
+        for member in list(self.active_group.get("members") or []):
+            normalized = normalize_member(member)
+            if normalized["b32"].lower() == my_b32:
+                continue
+            self.ensure_group_peer(normalized, authorized=True)
+            asyncio.create_task(self.connect_group_peer(normalized["b32"]))
+
+
+    async def connect_group_peer(self, b32: str):
+        if not self.active_group or not self.group_sam:
+            return
+        peer = self.group_peers.get(b32.lower())
+        if not peer or peer.get("writer"):
+            return
+
+        try:
+            reader, writer = await self.group_sam.stream_connect(b32)
+            peer["reader"] = reader
+            peer["writer"] = writer
+            await self.send_group_handshake(writer, peer["e2e"])
+            peer["task"] = asyncio.create_task(self.group_receive_loop(b32.lower(), reader, writer))
+            self.post("system", f"Group handshake sent: {peer['member']['name']}")
+        except Exception as e:
+            self.post("status", f"Group connect failed for {peer['member']['name']}: {e}")
+            peer["reader"] = None
+            peer["writer"] = None
+
+
+    async def send_group_handshake(self, writer, e2e: E2E):
+        if not self.group_pub_dest_b64:
+            raise RuntimeError("group identity is not ready")
+        writer.write(self.group_pub_dest_b64.encode() + b"\n")
+        writer.write(self.frame_message("S", self.group_pub_dest_b64))
+        writer.write(self.frame_message("K", e2e.public_bytes()))
+        await writer.drain()
+
+
+    async def group_accept_loop(self, group_key: str):
+        while self.active_group_key == group_key and self.group_sam:
+            try:
+                reader, writer = await self.group_sam.stream_accept()
+                try:
+                    identity_line = await asyncio.wait_for(reader.readline(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    writer.close()
+                    continue
+                if not identity_line:
+                    writer.close()
+                    continue
+
+                raw_dest = identity_line.decode().strip()
+                peer_b32 = self.group_sam.destination_to_b32(raw_dest).lower()
+                member = self.group_member_by_b32(peer_b32)
+                authorized = member is not None
+
+                if not authorized:
+                    if not group_is_admin(self.active_group):
+                        writer.close()
+                        await writer.wait_closed()
+                        continue
+                    member = {"name": f"member-{peer_b32[:8]}", "b32": peer_b32}
+
+                peer = self.ensure_group_peer(member, authorized=authorized)
+                peer["reader"] = reader
+                peer["writer"] = writer
+                peer["ready"] = False
+                peer["e2e"] = E2E(pq_enabled=False)
+                await self.send_group_handshake(writer, peer["e2e"])
+                peer["task"] = asyncio.create_task(self.group_receive_loop(peer_b32, reader, writer))
+                self.post("system", f"Group incoming connection: {member['name']}")
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(1)
+
+
+    async def group_receive_loop(self, peer_b32: str, reader, writer):
+        try:
+            while self.active_group and self.group_peers.get(peer_b32, {}).get("writer") == writer:
+                try:
+                    msg_type, msg_id, payload = await self.read_frame(reader)
+                except UnicodeDecodeError:
+                    continue
+                except ValueError:
+                    continue
+                await self.handle_group_frame(peer_b32, msg_type, msg_id, payload, writer)
+        except asyncio.CancelledError:
+            pass
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass
+        except Exception as e:
+            peer = self.group_peers.get(peer_b32)
+            if peer:
+                self.post("status", f"Group protocol error from {peer['member']['name']}: {e}")
+        finally:
+            peer = self.group_peers.get(peer_b32)
+            if peer and peer.get("writer") == writer:
+                peer["reader"] = None
+                peer["writer"] = None
+                peer["ready"] = False
+                task = peer.get("heartbeat_task")
+                if task:
+                    task.cancel()
+                    peer["heartbeat_task"] = None
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except:
+                pass
+
+
+    async def handle_group_frame(self, peer_b32: str, msg_type: str, msg_id: int, payload: bytes, writer):
+        peer = self.group_peers.get(peer_b32)
+        if not peer:
+            return
+
+        peer["heartbeat_last_rx_ts"] = time.monotonic()
+
+        if msg_type == "S":
+            body = payload.decode("utf-8", errors="ignore")
+            if body.startswith(HEARTBEAT_PING_PREFIX):
+                nonce = body[len(HEARTBEAT_PING_PREFIX):]
+                writer.write(self.frame_message("S", f"{HEARTBEAT_PONG_PREFIX}{nonce}"))
+                await writer.drain()
+                return
+            if body.startswith(HEARTBEAT_PONG_PREFIX):
+                return
+            if body == "__SIGNAL__:QUIT":
+                writer.close()
+                return
+
+            try:
+                announced_b32 = self.group_sam.destination_to_b32(body).lower()
+                if announced_b32 != peer_b32.lower():
+                    self.post("error", f"Group identity mismatch for {peer['member']['name']}: {announced_b32}")
+                    writer.close()
+            except Exception as e:
+                self.post("status", f"Invalid group identity from {peer['member']['name']}: {e}")
+            return
+
+        if msg_type == "K":
+            try:
+                peer["e2e"].receive_peer_key(payload)
+                if peer["e2e"].ready():
+                    peer["ready"] = True
+                    peer["heartbeat_last_rx_ts"] = time.monotonic()
+                    peer["heartbeat_last_ping_ts"] = time.monotonic()
+                    self.start_group_heartbeat(peer_b32)
+                    self.post("system", f"Group secure session ready: {peer['member']['name']}")
+                    self.network_status = "visible"
+                    self.watch_peer_b32(self.peer_b32)
+                    if group_is_admin(self.active_group):
+                        await self.send_group_roster_sync(peer_b32)
+                    else:
+                        await self.send_group_join_or_rename_to_owner(peer_b32)
+            except Exception as e:
+                self.post("error", f"Group E2E key error from {peer['member']['name']}: {e}")
+            return
+
+        if msg_type == "D":
+            if not peer.get("ready") or not peer.get("authorized") or len(payload) != 8:
+                return
+            delivered_id = struct.unpack(">Q", payload)[0]
+            self.mark_group_message_delivered(delivered_id, peer_b32)
+            return
+
+        if msg_type not in ("U", "L"):
+            return
+
+        if not peer.get("ready"):
+            return
+
+        plain = peer["e2e"].decrypt(payload)
+
+        if msg_type == "U":
+            if not peer.get("authorized"):
+                return
+            body = plain.decode("utf-8", errors="ignore")
+            self.append_chat_entry({
+                "kind": "group_bubble",
+                "mine": False,
+                "group_name": self.active_group.get("name", "Group"),
+                "author": peer["member"].get("name", "member"),
+                "message": body,
+                "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "msg_id": msg_id,
+            })
+            writer.write(self.frame_message("D", struct.pack(">Q", msg_id)))
+            await writer.drain()
+            return
+
+        await self.handle_group_list_payload(peer_b32, plain)
+
+
+    async def handle_group_list_payload(self, peer_b32: str, plain: bytes):
+        peer = self.group_peers.get(peer_b32)
+        if not peer or not self.active_group:
+            return
+
+        try:
+            data = json.loads(plain.decode("utf-8"))
+        except Exception:
+            return
+
+        kind = data.get("kind")
+        if kind == GROUP_CONTROL_JOIN_PROOF:
+            if not group_is_admin(self.active_group):
+                return
+            if (data.get("b32") or "").lower() != peer_b32.lower():
+                self.post("error", f"Rejected group invite proof b32 mismatch from {peer['member']['name']}.")
+                return
+            try:
+                member = {"name": data.get("name") or f"member-{peer_b32[:8]}", "b32": data.get("b32")}
+                redeem_group_invite_token(self.active_group, data.get("token") or "", member)
+                peer["member"] = normalize_member(member)
+                peer["authorized"] = True
+                self.active_group_key = self.group_store.save(self.active_group)
+                self.post("success", f"Redeemed group invite for {peer['member']['name']}.")
+                await self.send_group_roster_sync_to_ready_peers()
+            except Exception as e:
+                self.post("error", f"Rejected group invite proof from {peer['member']['name']}: {e}")
+            return
+
+        if kind == GROUP_CONTROL_RENAME_REQUEST:
+            if not group_is_admin(self.active_group):
+                return
+            if (data.get("b32") or "").lower() != peer_b32.lower():
+                self.post("error", f"Rejected group rename request b32 mismatch from {peer['member']['name']}.")
+                return
+            try:
+                member = {"name": data.get("name") or f"member-{peer_b32[:8]}", "b32": peer_b32}
+                changed = merge_group_member(self.active_group, member)
+                if changed:
+                    self.active_group["roster_version"] = int(self.active_group.get("roster_version") or 1) + 1
+                    sign_group_roster_if_admin(self.active_group)
+                    self.active_group_key = self.group_store.save(self.active_group)
+                    peer["member"] = normalize_member(member)
+                    await self.send_group_roster_sync_to_ready_peers()
+                    self.post("system", f"Accepted group rename request: {peer['member']['name']}.")
+            except Exception as e:
+                self.post("error", f"Rejected group rename request from {peer['member']['name']}: {e}")
+            return
+
+        data_format = data.get("format")
+        if data_format == "icedcomm-i2p-group-roster":
+            if not peer.get("authorized"):
+                return
+            try:
+                merge_group_roster_sync(self.active_group, data)
+                self.active_group_key = self.group_store.save(self.active_group)
+                self.post("system", f"Merged group roster from {peer['member']['name']}.")
+                await self.connect_group_members()
+            except Exception as e:
+                self.post("error", f"Group roster sync failed from {peer['member']['name']}: {e}")
+            return
+
+        if data_format == "icedcomm-i2p-group-invite":
+            if not peer.get("authorized"):
+                return
+            try:
+                merge_group_invite(self.active_group, data)
+                self.active_group_key = self.group_store.save(self.active_group)
+                self.post("system", f"Merged legacy group roster from {peer['member']['name']}.")
+                await self.connect_group_members()
+            except Exception as e:
+                self.post("error", f"Group invite merge failed from {peer['member']['name']}: {e}")
+
+
+    def start_group_heartbeat(self, peer_b32: str):
+        peer = self.group_peers.get(peer_b32)
+        if not peer:
+            return
+        task = peer.get("heartbeat_task")
+        if task and not task.done():
+            return
+        peer["heartbeat_task"] = asyncio.create_task(self.group_heartbeat_loop(peer_b32))
+
+
+    async def group_heartbeat_loop(self, peer_b32: str):
+        try:
+            while self.active_group and peer_b32 in self.group_peers:
+                await asyncio.sleep(1.0)
+                peer = self.group_peers.get(peer_b32)
+                if not peer or not peer.get("ready"):
+                    continue
+                writer = peer.get("writer")
+                if writer is None or writer.is_closing():
+                    break
+
+                now = time.monotonic()
+                if not peer.get("heartbeat_last_rx_ts"):
+                    peer["heartbeat_last_rx_ts"] = now
+                if not peer.get("heartbeat_last_ping_ts"):
+                    peer["heartbeat_last_ping_ts"] = now
+
+                if now - peer["heartbeat_last_rx_ts"] >= HEARTBEAT_TIMEOUT:
+                    self.post("system", f"Group member heartbeat timed out: {peer['member']['name']}")
+                    writer.close()
+                    break
+
+                if (
+                    now - peer["heartbeat_last_ping_ts"] >= HEARTBEAT_PING_INTERVAL
+                    and now - peer["heartbeat_last_rx_ts"] >= HEARTBEAT_PING_INTERVAL
+                ):
+                    peer["heartbeat_last_ping_ts"] = now
+                    writer.write(self.frame_message("S", f"{HEARTBEAT_PING_PREFIX}{self.heartbeat_nonce()}"))
+                    await writer.drain()
+        except asyncio.CancelledError:
+            pass
+
+
+    async def send_group_roster_sync(self, peer_b32: str):
+        peer = self.group_peers.get(peer_b32)
+        if not peer or not peer.get("ready") or not peer.get("authorized"):
+            return
+        try:
+            roster = roster_sync_from_meta(self.active_group)
+            payload = compact_json_bytes(roster)
+            cipher = peer["e2e"].encrypt(payload)
+            peer["writer"].write(self.frame_message("L", cipher))
+            await peer["writer"].drain()
+        except Exception as e:
+            self.post("status", f"Group roster sync failed for {peer['member']['name']}: {e}")
+
+
+    async def send_group_roster_sync_to_ready_peers(self):
+        for peer_b32 in list(self.group_peers.keys()):
+            await self.send_group_roster_sync(peer_b32)
+
+
+    async def send_group_join_or_rename_to_owner(self, only_peer_b32: str | None = None):
+        if not self.active_group:
+            return
+        owner_b32 = (self.active_group.get("owner_b32") or "").lower()
+        my_b32 = self.active_group.get("my_b32")
+        if not owner_b32 or not my_b32:
+            return
+
+        targets = [only_peer_b32.lower()] if only_peer_b32 else [owner_b32]
+        for peer_b32 in targets:
+            if peer_b32 != owner_b32:
+                continue
+            peer = self.group_peers.get(peer_b32)
+            if not peer or not peer.get("ready") or not peer.get("writer"):
+                continue
+
+            token = self.active_group.get("join_token")
+            if token:
+                control = build_group_control(GROUP_CONTROL_JOIN_PROOF, token, my_b32, group_self_display_name(self.active_group))
+            elif not group_is_admin(self.active_group) and self.active_group.get("my_name"):
+                control = build_group_control(GROUP_CONTROL_RENAME_REQUEST, "", my_b32, group_self_display_name(self.active_group))
+            else:
+                continue
+
+            cipher = peer["e2e"].encrypt(compact_json_bytes(control))
+            peer["writer"].write(self.frame_message("L", cipher))
+            await peer["writer"].drain()
+
+
+    async def send_group_message(self, message: str):
+        if not self.active_group:
+            self.post("error", "No group is open.")
+            return
+
+        ready_peers = [
+            (peer_b32, peer)
+            for peer_b32, peer in self.group_peers.items()
+            if peer.get("ready") and peer.get("authorized") and peer.get("writer")
+        ]
+
+        if not ready_peers:
+            self.post("error", "No ready group members. Wait for group sessions to connect.")
+            return
+
+        msg_id = self.generate_msg_id()
+        expected = [peer_b32 for peer_b32, _ in ready_peers]
+        entry = {
+            "kind": "group_bubble",
+            "mine": True,
+            "group_name": self.active_group.get("name", "Group"),
+            "author": "Me",
+            "message": message,
+            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "msg_id": msg_id,
+            "group_expected_acks": expected,
+            "group_received_acks": [],
+        }
+        self.group_pending_messages[msg_id] = entry
+
+        sent_any = False
+        for _, peer in ready_peers:
+            try:
+                cipher = peer["e2e"].encrypt(message.encode("utf-8"))
+                peer["writer"].write(self.frame_message("U", cipher, msg_id=msg_id))
+                await peer["writer"].drain()
+                sent_any = True
+            except Exception as e:
+                self.post("status", f"Group send failed for {peer['member']['name']}: {e}")
+
+        if sent_any:
+            self.append_chat_entry(entry)
+        else:
+            self.group_pending_messages.pop(msg_id, None)
+            self.post("error", "Group send failed.")
+
+
+    def mark_group_message_delivered(self, delivered_id: int, peer_b32: str):
+        entry = self.group_pending_messages.get(delivered_id)
+        if not entry:
+            return
+
+        received = entry.setdefault("group_received_acks", [])
+        if peer_b32 not in received:
+            received.append(peer_b32)
+
+        expected = entry.get("group_expected_acks") or []
+        if expected and len(received) >= len(expected):
+            self.group_pending_messages.pop(delivered_id, None)
+
+        self.rerender_chat_history()
 
 
     async def tunnel_watcher(self):
@@ -3802,6 +5034,12 @@ class I2PChat(App):
 
 
     async def on_unmount(self):
+        if self.app_mode in ("groups", "group"):
+            try:
+                await self.close_group(quiet=True)
+            except:
+                pass
+            return
         
         try:
             self.save_offline_state()
