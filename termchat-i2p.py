@@ -74,6 +74,10 @@ from vault import fs_decrypt, fs_encrypt, fs_runtime_enter, fs_runtime_leave, fs
 MAGIC = b"\x89I2P"
 PROTOCOL_VERSION = 3
 
+REPLY_BEGIN_MARKER = "[ICEDCOMM-REPLY-v1]"
+REPLY_QUOTE_MARKER = "[ICEDCOMM-QUOTE]"
+REPLY_END_MARKER = "[/ICEDCOMM-REPLY]"
+
 # SECURITY LIMITS
 MAX_FRAME_SIZE = 256 * 1024      # 256 KB max protocol frame
 MAX_FILE_SIZE = 50 * 1024 * 1024 # 50 MB max file
@@ -735,16 +739,16 @@ class I2PChat(App):
         hints = []
 
         if self.app_mode == "groups" and self.active_group:
-            hints = ["/group", "/disconnect", "/log", "/help"]
+            hints = ["/group", "/disconnect", "/logs", "/help"]
 
         elif self.app_mode == "groups":
-            hints = ["/admin", "/log", "/help"]
+            hints = ["/admin", "/logs", "/help"]
 
         elif self.app_mode == "group":
-            hints = ["/group", "/disconnect", "/log", "/help"]
+            hints = ["/group", "/disconnect", "/logs", "/help"]
 
         elif self.active_group:
-            hints = ["/group", "/disconnect", "/log", "/help"]
+            hints = ["/group", "/disconnect", "/logs", "/help"]
 
         elif self.pending_incoming_conn:
             hints = ["/accept", "/decline", "/logs", "/help"]
@@ -822,6 +826,8 @@ class I2PChat(App):
                     if peer.get("ready") and peer.get("authorized")
                 )
                 peer_count = len(self.active_group.get("members") or [])
+                display_ready_count = ready_count + 1
+                display_peer_count = peer_count + 1
                 is_active = ready_count > 0
                 border_col = "cyan" if is_active else "yellow"
                 title = "ACTIVE SESSION" if is_active else "TUNNELS READY"
@@ -831,7 +837,7 @@ class I2PChat(App):
                     f"[black on green] [bold]G[/] [/] "
                     f"[bold]{escape(my_name)}[/] [dim]#{escape(group_name)}[/]"
                 )
-                right_content = f"[green]{group_b32_display}[/] [white]:[/] [cyan dim]{ready_count}/{peer_count} active[/]"
+                right_content = f"[green]{group_b32_display}[/] [white]:[/] [cyan dim]{display_ready_count}/{display_peer_count} active[/]"
             else:
                 groups_count = len(self.group_store.list_groups())
                 left_content = "[black on green] [bold]G[/] [/] [bold]GROUPS[/]"
@@ -1048,10 +1054,60 @@ class I2PChat(App):
         return re.sub(address_pattern, r"[bold cyan]\1[/]", safe_message)
 
 
+    def parse_reply_text(self, message: str):
+        value = str(message)
+        prefix = f"{REPLY_BEGIN_MARKER}\n"
+        if not value.startswith(prefix):
+            return None
+
+        rest = value[len(prefix):]
+        author, separator, rest = rest.partition("\n")
+        if not separator:
+            return None
+
+        quote_prefix = f"{REPLY_QUOTE_MARKER}\n"
+        if not rest.startswith(quote_prefix):
+            return None
+
+        rest = rest[len(quote_prefix):]
+        end_marker = f"\n{REPLY_END_MARKER}\n"
+        quote, separator, body = rest.partition(end_marker)
+        if not separator:
+            return None
+
+        return {
+            "author": author,
+            "quote": quote,
+            "body": body,
+        }
+
+
+    def render_text_message_content(self, message: str):
+        reply = self.parse_reply_text(message)
+        if not reply:
+            return f"[white]{self.format_chat_message(message)}[/]"
+
+        content = Table.grid(expand=False)
+        content.add_column()
+
+        quote_header = self.format_chat_message(f"Reply to {reply['author']}")
+        quote_text = self.format_chat_message(reply["quote"])
+        quote_panel = Panel(
+            f"[dim]{quote_header}[/]\n[bright_black]{quote_text}[/]",
+            border_style="bright_black",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=False,
+        )
+        content.add_row(quote_panel)
+        content.add_row(Text.from_markup(f"[white]{self.format_chat_message(reply['body'])}[/]"))
+        return content
+
+
     def render_chat_entry(self, entry):
         if entry.get("kind") == "bubble":
             type_name = entry["type"]
-            formatted_msg = self.format_chat_message(entry["message"])
+            message_content = self.render_text_message_content(entry["message"])
 
             if type_name == "me":
                 box_color = "green"
@@ -1076,7 +1132,7 @@ class I2PChat(App):
                 delivery = f" [dim green]{mark}[/]"
 
             message_panel = Panel(
-                f"[white]{formatted_msg}[/]",
+                message_content,
                 title=f"[#5f5f5f][{entry['timestamp']} UTC][/] [bold {box_color}]{display_name}[/]{delivery}",
                 title_align="left",
                 border_style=box_color,
@@ -1105,7 +1161,7 @@ class I2PChat(App):
             return Align(message_panel, align=entry["alignment"]), True
 
         if entry.get("kind") == "group_bubble":
-            formatted_msg = self.format_chat_message(entry["message"])
+            message_content = self.render_text_message_content(entry["message"])
             mine = bool(entry.get("mine"))
             box_color = "green" if mine else "cyan"
             display_name = "Me" if mine else entry.get("author", "Group")
@@ -1120,7 +1176,7 @@ class I2PChat(App):
                     delivery = f" [dim green]{mark} {len(received)}/{len(expected)}[/]"
 
             message_panel = Panel(
-                f"[white]{formatted_msg}[/]",
+                message_content,
                 title=f"[#5f5f5f][{entry['timestamp']} UTC][/] [bold {box_color}]{display_name}[/]{delivery}",
                 title_align="left",
                 border_style=box_color,
@@ -1199,15 +1255,7 @@ class I2PChat(App):
             })
 
         self.append_log_entry(content)
-
-        if type_name in ("system", "info", "status"):
-            return content
-
-        else:
-            return self.append_chat_entry({
-                "kind": "raw",
-                "content": content,
-            })
+        return content
             
             
     
@@ -2619,10 +2667,9 @@ class I2PChat(App):
         is_persistent = self.profile != "default"
         
         
-        self.append_chat_entry({
-            "kind": "raw",
-            "content": f"[#878700]SYSTEM:[/] [dim #5f5f5f italic]Mode:[/][not bold {'yellow' if is_persistent else 'green'}] {'PERSISTENT' if is_persistent else 'TRANSIENT'}[/]",
-        })
+        self.append_log_entry(
+            f"[#878700]SYSTEM:[/] [dim #5f5f5f italic]Mode:[/][not bold {'yellow' if is_persistent else 'green'}] {'PERSISTENT' if is_persistent else 'TRANSIENT'}[/]"
+        )
 
         
         
@@ -2732,10 +2779,7 @@ class I2PChat(App):
             
             
         except Exception as e:
-            self.append_chat_entry({
-                "kind": "raw",
-                "content": f"[red]Initialization Error:[/] {e}",
-            })
+            self.append_log_entry(f"[red]Initialization Error:[/] {e}")
             self.network_status = "initializing"
             
             try:
@@ -2784,7 +2828,7 @@ class I2PChat(App):
                     return
 
                 if msg.startswith("/"):
-                    self.post("error", "Group chat supports /group, /disconnect, /log, and /help.")
+                    self.post("error", "Group chat supports /group, /disconnect, /logs, and /help.")
                     return
 
                 await self.send_group_message(msg)
@@ -2797,7 +2841,7 @@ class I2PChat(App):
             elif msg.strip() == "/help":
                 self.show_help()
             else:
-                self.post("error", "Group manager mode supports /admin, /log, and /help.")
+                self.post("error", "Group manager mode supports /admin, /logs, and /help.")
             return
 
         if self.app_mode == "group":
@@ -2819,7 +2863,7 @@ class I2PChat(App):
                 return
 
             if msg.startswith("/"):
-                self.post("error", "This is group chat mode. Use /group, /disconnect, /log, or /help.")
+                self.post("error", "This is group chat mode. Use /group, /disconnect, /logs, or /help.")
                 return
 
             if self.active_group:
@@ -3934,7 +3978,7 @@ class I2PChat(App):
 
         if my_b32:
             rows.append({
-                "role": "OWNER" if my_b32 == owner_b32 else "ME",
+                "role": "OWNER" if my_b32 == owner_b32 else "MEMBER",
                 "state": "LOCAL",
                 "name": group_self_display_name(self.active_group),
                 "b32": my_b32,
