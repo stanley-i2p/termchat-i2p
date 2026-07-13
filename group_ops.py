@@ -72,6 +72,17 @@ def group_is_admin(meta: dict) -> bool:
     return bool(my_b32 and owner_b32 and my_b32 == owner_b32)
 
 
+def validate_group_display_name(name: str) -> str:
+    trimmed = str(name or "").strip()
+    if not trimmed:
+        raise ValueError("Group display name cannot be empty.")
+    if len(trimmed) > 32:
+        raise ValueError("Group display name must be 32 characters or less.")
+    if any(ord(char) < 32 or ord(char) == 127 for char in trimmed):
+        raise ValueError("Group display name cannot contain control characters.")
+    return trimmed
+
+
 def normalize_member(member: dict) -> dict:
     return {
         "name": str(member.get("name") or "").strip()[:32] or f"member-{short_b32(member.get('b32'))}",
@@ -121,16 +132,36 @@ def merge_group_member(meta: dict, member: dict) -> bool:
     return True
 
 
+def apply_group_member_rename(meta: dict, member_b32: str, display_name: str) -> bool:
+    validated_name = validate_group_display_name(display_name)
+    member_b32 = str(member_b32 or "").strip().lower()
+    if not is_valid_b32_address(member_b32):
+        raise ValueError("group member address is invalid")
+
+    for member in meta.get("members") or []:
+        if str(member.get("b32") or "").lower() == member_b32:
+            if member.get("name") == validated_name:
+                return False
+            member["name"] = validated_name
+            meta["roster_version"] = int(meta.get("roster_version") or 1) + 1
+            sign_group_roster_if_admin(meta)
+            return True
+
+    raise ValueError("group member is not in the roster")
+
+
 def make_group_meta(name: str, my_name: str = "") -> dict:
     trimmed = name.strip()
     if not trimmed:
         raise ValueError("group name cannot be empty")
+    if my_name:
+        my_name = validate_group_display_name(my_name)
     return {
         "id": f"tmp_{trimmed}_{time.time_ns()}",
         "name": trimmed,
         "my_dest_b64": None,
         "my_b32": None,
-        "my_name": my_name.strip()[:32],
+        "my_name": my_name,
         "owner_b32": None,
         "roster_version": 1,
         "members": [],
@@ -295,11 +326,13 @@ def redeem_group_invite_token(meta: dict, token: str, member: dict) -> None:
     for invite in meta.get("issued_invites") or []:
         if invite.get("token") == token:
             redeemed = invite.get("redeemed_b32")
-            member_b32 = normalize_member(member)["b32"]
+            validate_group_display_name(str(member.get("name") or ""))
+            normalized_member = normalize_member(member)
+            member_b32 = normalized_member["b32"]
             if redeemed and redeemed.lower() != member_b32.lower():
                 raise ValueError("group invite token already redeemed")
             invite["redeemed_b32"] = member_b32
-            changed = merge_group_member(meta, member)
+            changed = merge_group_member(meta, normalized_member)
             if changed:
                 meta["roster_version"] = int(meta.get("roster_version") or 1) + 1
             sign_group_roster_if_admin(meta)
@@ -311,6 +344,8 @@ def redeem_group_invite_token(meta: dict, token: str, member: dict) -> None:
 def merge_group_invite(meta: dict, invite: dict) -> None:
     if invite.get("format") != GROUP_INVITE_FORMAT or invite.get("version") != 1:
         raise ValueError("unsupported group invite")
+    if not str(invite.get("group_name") or "").strip():
+        raise ValueError("invite group name is empty")
     if not is_valid_b32_address(invite.get("inviter_b32") or ""):
         raise ValueError("invite inviter address is invalid")
 
@@ -355,6 +390,8 @@ def merge_group_invite(meta: dict, invite: dict) -> None:
 def merge_group_roster_sync(meta: dict, roster: dict) -> None:
     if roster.get("format") != GROUP_ROSTER_FORMAT or roster.get("version") != 1:
         raise ValueError("unsupported group roster sync")
+    if not str(roster.get("group_name") or "").strip():
+        raise ValueError("group roster name is empty")
     owner_b32 = str(roster.get("owner_b32") or "").lower()
     if not is_valid_b32_address(owner_b32):
         raise ValueError("group roster owner address is invalid")
@@ -376,14 +413,26 @@ def merge_group_roster_sync(meta: dict, roster: dict) -> None:
         roster.get("roster_signature") or "",
     )
 
-    if int(roster.get("roster_version") or 1) >= int(meta.get("roster_version") or 1):
+    incoming_version = int(roster.get("roster_version") or 1)
+    current_version = int(meta.get("roster_version") or 1)
+    if incoming_version > current_version:
+        my_b32 = str(meta.get("my_b32") or "").lower()
+        self_removed = bool(
+            my_b32
+            and my_b32 != owner_b32
+            and not any(member["b32"].lower() == my_b32 for member in members)
+        )
+
         meta["name"] = roster.get("group_name") or meta.get("name") or "group"
         meta["owner_b32"] = owner_b32
         meta["id"] = owner_b32
         meta["members"] = []
-        for member in members:
-            merge_group_member(meta, member)
-        meta["roster_version"] = int(roster.get("roster_version") or 1)
+        if self_removed:
+            meta["join_token"] = None
+        else:
+            for member in members:
+                merge_group_member(meta, member)
+        meta["roster_version"] = incoming_version
         meta["roster_signing_pubkey"] = roster.get("roster_signing_pubkey")
         meta["roster_signature"] = roster.get("roster_signature")
 

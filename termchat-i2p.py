@@ -45,6 +45,7 @@ from group_ops import (
     GROUP_CONTROL_RENAME_REQUEST,
     GroupRuntimeLock,
     GroupStore,
+    apply_group_member_rename,
     build_group_control,
     compact_json_bytes,
     decode_group_invite_string,
@@ -55,12 +56,12 @@ from group_ops import (
     issue_group_invite,
     make_group_meta,
     merge_group_invite,
-    merge_group_member,
     merge_group_roster_sync,
     normalize_member,
     redeem_group_invite_token,
     roster_sync_from_meta,
     sign_group_roster_if_admin,
+    validate_group_display_name,
 )
 from group_screens import ActiveGroupScreen, GroupManagerScreen
 from help_screen import HELP_LINES, HelpScreen
@@ -4310,11 +4311,13 @@ class I2PChat(App):
         if not self.active_group:
             self.post("error", "No group is open. Use /group-open <name-or-key>.")
             return
-        if not name:
-            self.post("error", "Usage: /group-name <your-name>")
+        try:
+            name = validate_group_display_name(name)
+        except Exception as e:
+            self.post("error", str(e))
             return
 
-        self.active_group["my_name"] = name[:32]
+        self.active_group["my_name"] = name
         if group_is_admin(self.active_group):
             sign_group_roster_if_admin(self.active_group)
             self.group_store.save(self.active_group)
@@ -4666,13 +4669,10 @@ class I2PChat(App):
                 self.post("error", f"Rejected group rename request b32 mismatch from {peer['member']['name']}.")
                 return
             try:
-                member = {"name": data.get("name") or f"member-{peer_b32[:8]}", "b32": peer_b32}
-                changed = merge_group_member(self.active_group, member)
+                changed = apply_group_member_rename(self.active_group, peer_b32, data.get("name") or "")
                 if changed:
-                    self.active_group["roster_version"] = int(self.active_group.get("roster_version") or 1) + 1
-                    sign_group_roster_if_admin(self.active_group)
                     self.active_group_key = self.group_store.save(self.active_group)
-                    peer["member"] = normalize_member(member)
+                    peer["member"] = normalize_member({"name": data.get("name"), "b32": peer_b32})
                     await self.send_group_roster_sync_to_ready_peers()
                     self.post("system", f"Accepted group rename request: {peer['member']['name']}.")
             except Exception as e:
