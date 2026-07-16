@@ -17,7 +17,7 @@ use tokio::net::{
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::{sleep, timeout};
 
-const NUM_DROPS: usize = 1;
+const NUM_DROPS: usize = 3;
 
 const SAM_HOST: &str = "127.0.0.1";
 const SAM_PORT: u16 = 7656;
@@ -551,6 +551,32 @@ async fn handle_client(
     let _ = writer.shutdown().await;
 }
 
+async fn handle_client_limited(
+    drop_name: String,
+    state: ServerState,
+    reader: BufReader<OwnedReadHalf>,
+    mut writer: OwnedWriteHalf,
+) {
+    let Some(sem) = state.semaphore(&drop_name) else {
+        eprintln!("[{}] missing semaphore", drop_name);
+        let _ = writer.shutdown().await;
+        return;
+    };
+
+    let Ok(_permit) = sem.try_acquire_owned() else {
+        println!(
+            "[{}] connection rejected: too many active clients",
+            drop_name
+        );
+        let _ = write_all_with_timeout(&mut writer, b"ERR\n").await;
+        let _ = flush_with_timeout(&mut writer).await;
+        let _ = writer.shutdown().await;
+        return;
+    };
+
+    handle_client(&drop_name, state, reader, writer).await;
+}
+
 async fn create_session(name: &str, keyfile: &Path) -> io::Result<TcpStream> {
     let mut stream = TcpStream::connect((SAM_HOST, SAM_PORT)).await?;
 
@@ -672,27 +698,22 @@ async fn accept_loop(name: String, state: ServerState, shutdown: Shutdown) {
 
             let _dest_line = match read_line_from_half(&mut reader).await? {
                 Some(v) => v,
-                None => return Ok(()),
+                None => {
+                    println!("[{}] incoming stream closed before peer destination", name);
+                    return Ok(());
+                }
             };
 
             //let bytes = dest_line.as_bytes();
             //let preview_len = bytes.len().min(60);
             //println!("[{}] incoming from: {:?}", name, &bytes[..preview_len]);
 
-            let Some(sem) = state.semaphore(&name) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("missing semaphore for {}", name),
-                ));
-            };
-
-            let Ok(permit) = sem.try_acquire_owned() else {
-                println!("[{}] connection rejected: too many active clients", name);
-                return Ok(());
-            };
-
-            handle_client(&name, state.clone(), reader, write_half).await;
-            drop(permit);
+            tokio::spawn(handle_client_limited(
+                name.clone(),
+                state.clone(),
+                reader,
+                write_half,
+            ));
             Ok(())
         }
         .await;
@@ -805,4 +826,3 @@ async fn main() -> io::Result<()> {
     println!("[INFO] Shutdown complete");
     Ok(())
 }
-

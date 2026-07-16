@@ -30,7 +30,7 @@ STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 #
 # Since adding the anti flood PoW system, debugging with more than 1 instance is no
 # longer advisable
-NUM_DROPS = 1
+NUM_DROPS = 3
 
 SAM_HOST = "127.0.0.1"
 SAM_PORT = 7656
@@ -395,6 +395,29 @@ async def handle_client(drop_name, reader, writer):
 
 
 
+async def handle_client_limited(drop_name, reader, writer):
+
+    sem = drop_semaphores[drop_name]
+
+    if sem.locked():
+        print(f"[{drop_name}] connection rejected: too many active clients")
+        try:
+            writer.write(b"ERR\n")
+            await asyncio.wait_for(writer.drain(), timeout=CLIENT_WRITE_TIMEOUT)
+        except Exception:
+            pass
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return
+
+    async with sem:
+        await handle_client(drop_name, reader, writer)
+
+
+
 # SAM raw control (need to get rid of libi2p in client also)
 
 
@@ -515,23 +538,12 @@ async def accept_loop(name):
             dest_line = await reader.readline()
 
             if not dest_line:
+                print(f"[{name}] incoming stream closed before peer destination")
                 continue
 
             #print(f"[{name}] incoming from: {dest_line[:60]}")
 
-            sem = drop_semaphores[name]
-
-            if sem.locked():
-                print(f"[{name}] connection rejected: too many active clients")
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except:
-                    pass
-                continue
-
-            async with sem:
-                await handle_client(name, reader, writer)
+            asyncio.create_task(handle_client_limited(name, reader, writer))
 
         except asyncio.CancelledError:
             break
