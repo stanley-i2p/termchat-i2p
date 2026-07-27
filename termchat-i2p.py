@@ -13,10 +13,9 @@ import asyncio
 from textual.app import App, ComposeResult
 from textual import events
 from textual.screen import ModalScreen
-from textual.widgets import Input, RichLog
-from textual.containers import Container
+from textual.widgets import Input, Static
+from textual.containers import Container, ScrollableContainer
 from textual.reactive import reactive
-from textual.widgets import Static
 from datetime import datetime, timezone
 import re
 from rich.markup import escape
@@ -54,6 +53,7 @@ from group_ops import (
     group_self_display_name,
     group_storage_key,
     issue_group_invite,
+    is_valid_b32_address,
     make_group_meta,
     merge_group_invite,
     merge_group_roster_sync,
@@ -569,9 +569,21 @@ class ChatInput(Input):
         event.stop()
 
 
+class ChatEntryWidget(Static):
+    can_focus = True
+
+    def __init__(self, entry: dict, renderable, *, expand: bool = False):
+        super().__init__(renderable, expand=expand)
+        self.entry = entry
+
+    def _on_click(self, event: events.Click) -> None:
+        self.focus()
+        event.stop()
+
+
 class I2PChat(App):
     # This maps "q" or "ctrl+q" to the action "quit"
-    BINDINGS = [("q", "quit", "Quit"), ("ctrl+q", "quit", "Quit"), ("c", "copy_my_addr", "Copy My B32")]
+    BINDINGS = [("q", "quit", "Quit"), ("ctrl+q", "quit", "Quit"), ("c", "copy_focused_bubble", "Copy Bubble"), ("r", "reply_to_focused_bubble", "Reply")]
         
     CSS = """
     #status_bar {
@@ -603,10 +615,20 @@ class I2PChat(App):
     }
     
 
-    RichLog {
+    #chat_window {
         height: 1fr;
         border: solid white;
         background: $surface;
+        overflow-y: auto;
+    }
+
+    ChatEntryWidget {
+        height: auto;
+        padding: 0 1;
+    }
+
+    ChatEntryWidget:focus {
+        background: $boost;
     }
     """
     
@@ -685,6 +707,7 @@ class I2PChat(App):
         self.pending_messages = {}
         self.chat_history = []
         self.log_history = []
+        self.reply_target = None
 
         self.group_store = GroupStore(BASE_DIR)
         self.active_group_key = None
@@ -761,7 +784,7 @@ class I2PChat(App):
     def compose(self) -> ComposeResult:
                
         yield Static(id="status_bar")
-        yield RichLog(id="chat_window", highlight=False, markup=True)
+        yield ScrollableContainer(id="chat_window")
 
         with Container(id="bottom_bar"):
             yield ChatInput(placeholder="Type message and press Enter...", id="chat_input")
@@ -819,6 +842,9 @@ class I2PChat(App):
 
             if self.is_persistent_mode():
                 hints.append("/dd")
+
+        if self.reply_target:
+            hints.insert(0, f"replying to {escape(self.reply_target['author'])}")
 
         return "   ".join(hints)
     
@@ -1028,19 +1054,141 @@ class I2PChat(App):
     
     
 
-    def action_copy_my_addr(self) -> None:
-        if hasattr(self, 'my_b32'):
-            addr = self.my_b32
-            pyperclip.copy(addr)  # Use xclip automatically
-            self.post("success", "Copied to system clipboard!")
+    def action_copy_focused_bubble(self) -> None:
+        entry = self.focused_chat_entry()
+        if entry:
+            pyperclip.copy(self.chat_entry_copy_text(entry))
+            self.post("success", "Copied selected bubble to system clipboard!")
+        else:
+            self.post("error", "No bubble selected.")
+
+
+    def copy_my_addr_to_clipboard(self) -> None:
+        if not hasattr(self, 'my_b32'):
+            self.post("error", "Local b32 address is not ready.")
+            return
+        pyperclip.copy(self.my_b32)
+        self.post("success", "Copied local b32 address to system clipboard!")
+
+
+    def action_reply_to_focused_bubble(self) -> None:
+        entry = self.focused_chat_entry()
+        if not entry:
+            return
+
+        quote = self.chat_entry_body_text(entry).strip()
+        if not quote:
+            return
+
+        self.reply_target = {
+            "author": self.chat_entry_author(entry),
+            "quote": quote,
+        }
+        self.update_command_bar()
+        self.query_one("#chat_input", Input).focus()
+
+
+    def focused_chat_entry(self):
+        focused = getattr(self, "focused", None)
+        if isinstance(focused, ChatEntryWidget):
+            return focused.entry
+        return None
+
+
+    def focused_chat_widget(self):
+        focused = getattr(self, "focused", None)
+        return focused if isinstance(focused, ChatEntryWidget) else None
+
+
+    def chat_entry_author(self, entry) -> str:
+        if entry.get("kind") == "group_bubble":
+            return "Me" if entry.get("mine") else entry.get("author", "Group")
+
+        type_name = entry.get("type")
+        if type_name == "me":
+            return "Me"
+        if type_name == "peer":
+            return "Peer"
+        if type_name == "me_offline":
+            return "Me-Offline"
+        if type_name == "peer_offline":
+            return "Peer-Offline"
+        return "Message"
+
+
+    def chat_entry_body_text(self, entry) -> str:
+        message = str(entry.get("message") or "")
+        reply = self.parse_reply_text(message)
+        return reply["body"] if reply else message
+
+
+    def chat_entry_copy_text(self, entry) -> str:
+        message = str(entry.get("message") or entry.get("content") or "")
+        reply = self.parse_reply_text(message)
+        if not reply:
+            return message
+        return f"Reply to {reply['author']}:\n{reply['quote']}\n\n{reply['body']}"
+
+
+    def apply_reply_target(self, message: str) -> str:
+        if not self.reply_target or message.startswith("/"):
+            return message
+
+        target = self.reply_target
+        self.reply_target = None
+        self.update_command_bar()
+        return (
+            f"{REPLY_BEGIN_MARKER}\n"
+            f"{target['author']}\n"
+            f"{REPLY_QUOTE_MARKER}\n"
+            f"{target['quote']}\n"
+            f"{REPLY_END_MARKER}\n"
+            f"{message}"
+        )
+
+
+    def focus_adjacent_chat_entry(self, direction: int) -> bool:
+        current = self.focused_chat_widget()
+        if not current:
+            return False
+
+        widgets = list(self.chat_log.query(ChatEntryWidget))
+        if current not in widgets:
+            return False
+
+        next_index = widgets.index(current) + direction
+        if next_index < 0 or next_index >= len(widgets):
+            return False
+
+        widgets[next_index].focus()
+        if hasattr(widgets[next_index], "scroll_visible"):
+            widgets[next_index].scroll_visible(animate=False)
+        return True
 
 
 
     def on_key(self, event: events.Key) -> None:
-        if event.key not in ("up", "down"):
+        if isinstance(self.screen, ModalScreen):
             return
 
-        if isinstance(self.screen, ModalScreen):
+        if isinstance(getattr(self, "focused", None), ChatEntryWidget):
+            if event.key == "up":
+                event.prevent_default()
+                event.stop()
+                self.focus_adjacent_chat_entry(-1)
+                return
+            if event.key == "down":
+                event.prevent_default()
+                event.stop()
+                self.focus_adjacent_chat_entry(1)
+                return
+            if event.key == "enter":
+                event.prevent_default()
+                event.stop()
+                self.query_one("#chat_input", Input).focus()
+                return
+
+        if event.key not in ("up", "down"):
             return
 
         #input_widget = self.query_one(Input)
@@ -1232,20 +1380,36 @@ class I2PChat(App):
     def append_chat_entry(self, entry):
         self.chat_history.append(entry)
         renderable, expand = self.render_chat_entry(entry)
-        self.chat_log.write(renderable, expand=expand)
+        widget = ChatEntryWidget(entry, renderable, expand=expand)
+        entry["_widget"] = widget
+        self.chat_log.mount(widget)
+        self.call_after_refresh(lambda: self.chat_log.scroll_end(animate=False))
         return entry
 
 
     def rerender_chat_history(self):
-        self.chat_log.clear()
+        self.chat_log.remove_children()
         for entry in self.chat_history:
             renderable, expand = self.render_chat_entry(entry)
-            self.chat_log.write(renderable, expand=expand)
+            widget = ChatEntryWidget(entry, renderable, expand=expand)
+            entry["_widget"] = widget
+            self.chat_log.mount(widget)
+        self.call_after_refresh(lambda: self.chat_log.scroll_end(animate=False))
+
+
+    def refresh_chat_entry(self, entry):
+        widget = entry.get("_widget")
+        if not widget:
+            self.rerender_chat_history()
+            return
+        renderable, expand = self.render_chat_entry(entry)
+        widget.expand = expand
+        widget.update(renderable)
 
 
     def mark_chat_entry_delivered(self, entry):
         entry["delivered"] = True
-        self.rerender_chat_history()
+        self.refresh_chat_entry(entry)
 
 
     def append_log_entry(self, content: str):
@@ -2683,7 +2847,7 @@ class I2PChat(App):
 
     async def on_mount(self):
         
-        self.chat_log = self.query_one("#chat_window", RichLog)
+        self.chat_log = self.query_one("#chat_window", ScrollableContainer)
 
         if self.app_mode == "groups":
             await self.on_mount_group_manager()
@@ -2879,6 +3043,7 @@ class I2PChat(App):
                     self.post("error", "Group chat supports /group, /profiles, /contacts, /disconnect, /logs, and /help.")
                     return
 
+                msg = self.apply_reply_target(msg)
                 await self.send_group_message(msg)
                 return
 
@@ -2921,6 +3086,7 @@ class I2PChat(App):
                 return
 
             if self.active_group:
+                msg = self.apply_reply_target(msg)
                 await self.send_group_message(msg)
             else:
                 self.post("error", "Group is not ready.")
@@ -3242,6 +3408,10 @@ class I2PChat(App):
         elif msg.strip() == "/logs":
             self.show_logs()
             return
+
+        elif msg.strip() == "/copyaddr":
+            self.copy_my_addr_to_clipboard()
+            return
         
                 
         elif msg.strip() == "/disconnect":
@@ -3252,10 +3422,12 @@ class I2PChat(App):
 
 
         elif self.active_group:
+            msg = self.apply_reply_target(msg)
             await self.send_group_message(msg)
             
             
         elif self.conn and self.live_ready:
+            msg = self.apply_reply_target(msg)
             msg_id = None
             try:
                 _, writer = self.conn
@@ -3289,6 +3461,7 @@ class I2PChat(App):
             self.post("error", "Live connection is not ready yet. Wait for secure session to be established.")
                 
         elif self.offline_ready() and self.offline_mode:
+            msg = self.apply_reply_target(msg)
             try:
                 blob_key = self.get_offline_blob_key()
                 frame = self.frame_message('U', msg.encode())
@@ -4263,8 +4436,11 @@ class I2PChat(App):
                 meta["my_dest_b64"] = group_dest_b64
                 self.group_pub_dest_b64 = group_pub_dest_b64
 
-            session_b32 = self.group_sam.destination_to_b32(meta["my_dest_b64"])
-            self.group_session_id = f"chat_group_{session_b32[:6]}_{session_b32[-14:-8]}_{int(time.time())}"
+            session_b32 = str(meta.get("my_b32") or "").lower()
+            if is_valid_b32_address(session_b32):
+                self.group_session_id = f"chat_group_{session_b32[:6]}_{session_b32[-14:-8]}_{int(time.time())}"
+            else:
+                self.group_session_id = f"chat_group_init_{int(time.time())}"
             await self.group_sam.create_session(
                 self.group_session_id,
                 destination=meta["my_dest_b64"],
@@ -5068,7 +5244,7 @@ class I2PChat(App):
         if expected and len(received) >= len(expected):
             self.group_pending_messages.pop(delivered_id, None)
 
-        self.rerender_chat_history()
+        self.refresh_chat_entry(entry)
 
 
     async def tunnel_watcher(self):
