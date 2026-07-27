@@ -61,6 +61,7 @@ HELP_LINES = [
     ("help_bold", "Utility:"),
     ("help", ""),
     ("help", "  c                        Copy local b32 address to your clipboard"),
+    ("help", "  /profiles, /contacts     Show persistent 1:1 accounts"),
     ("help", "  /logs                    Show system logs"),
     ("help", "  /help                    Show this help"),
     ("help", "  /CTRL+q                  Exit program"),

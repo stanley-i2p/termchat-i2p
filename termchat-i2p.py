@@ -66,6 +66,7 @@ from group_ops import (
 from group_screens import ActiveGroupScreen, GroupManagerScreen
 from help_screen import HELP_LINES, HelpScreen
 from logs_screen import LogsScreen
+from profiles_screen import ProfilesScreen
 from sam_client import SAMClient
 
 from vault import fs_decrypt, fs_encrypt, fs_runtime_enter, fs_runtime_leave, fs_verify_passphrase
@@ -101,6 +102,7 @@ HEARTBEAT_PING_INTERVAL = 10.0
 HEARTBEAT_TIMEOUT = 35.0
 HEARTBEAT_PING_PREFIX = "__SIGNAL__:PING:"
 HEARTBEAT_PONG_PREFIX = "__SIGNAL__:PONG:"
+GROUP_RECONNECT_INTERVAL = 5.0
 
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".termchat-i2p")
 BASE_DIR = os.path.abspath(BASE_DIR)
@@ -187,6 +189,40 @@ def secure_delete_profile(profile_name: str):
     else:
         print(f"[INFO] Profile does not exist: {profile_name}")
         
+
+
+def list_persistent_profile_rows() -> list[dict]:
+    profiles_dir = os.path.join(BASE_DIR, "profiles")
+    rows = []
+    if not os.path.isdir(profiles_dir):
+        return rows
+
+    for name in sorted(os.listdir(profiles_dir), key=str.lower):
+        if name == "default" or name.startswith("."):
+            continue
+        profile_dir = os.path.join(profiles_dir, name)
+        if not os.path.isdir(profile_dir):
+            continue
+
+        peer_b32 = ""
+        key_file = os.path.join(profile_dir, f"{name}.dat")
+        if os.path.isfile(key_file):
+            try:
+                with open(key_file, "r", encoding="utf-8") as handle:
+                    lines = [line.strip() for line in handle.readlines() if line.strip()]
+                if len(lines) > 1:
+                    peer_b32 = lines[1]
+            except Exception:
+                peer_b32 = ""
+
+        rows.append({
+            "index": len(rows) + 1,
+            "profile": name,
+            "state": "LOCKED" if peer_b32 else "UNLOCKED",
+            "peer_b32": peer_b32,
+        })
+
+    return rows
 
 
 
@@ -657,6 +693,7 @@ class I2PChat(App):
         self.group_session_id = None
         self.group_pub_dest_b64 = None
         self.group_accept_task = None
+        self.group_reconnect_task = None
         self.group_peers = {}
         self.group_pending_messages = {}
         self.group_runtime_lock = None
@@ -1216,6 +1253,10 @@ class I2PChat(App):
 
     def show_logs(self):
         self.push_screen(LogsScreen(list(self.log_history)))
+
+
+    def open_profiles_screen(self):
+        self.push_screen(ProfilesScreen(list_persistent_profile_rows()))
 
 
     def post(self, type_name: str, message: str, msg_id=None):
@@ -2809,6 +2850,10 @@ class I2PChat(App):
 
         if self.app_mode == "groups":
             if self.active_group:
+                if msg.strip() in ("/profiles", "/contacts"):
+                    self.open_profiles_screen()
+                    return
+
                 if msg.strip() == "/disconnect":
                     await self.close_group()
                     self.network_status = "visible"
@@ -2829,7 +2874,7 @@ class I2PChat(App):
                     return
 
                 if msg.startswith("/"):
-                    self.post("error", "Group chat supports /group, /disconnect, /logs, and /help.")
+                    self.post("error", "Group chat supports /group, /profiles, /contacts, /disconnect, /logs, and /help.")
                     return
 
                 await self.send_group_message(msg)
@@ -2837,18 +2882,24 @@ class I2PChat(App):
 
             if msg.strip() == "/admin":
                 self.open_group_manager()
+            elif msg.strip() in ("/profiles", "/contacts"):
+                self.open_profiles_screen()
             elif msg.strip() in ("/log", "/logs"):
                 self.show_logs()
             elif msg.strip() == "/help":
                 self.show_help()
             else:
-                self.post("error", "Group manager mode supports /admin, /logs, and /help.")
+                self.post("error", "Group manager mode supports /admin, /profiles, /contacts, /logs, and /help.")
             return
 
         if self.app_mode == "group":
             if msg.strip() == "/disconnect":
                 await self.close_group()
                 self.exit()
+                return
+
+            if msg.strip() in ("/profiles", "/contacts"):
+                self.open_profiles_screen()
                 return
 
             if msg.strip() == "/group":
@@ -2864,7 +2915,7 @@ class I2PChat(App):
                 return
 
             if msg.startswith("/"):
-                self.post("error", "This is group chat mode. Use /group, /disconnect, /logs, or /help.")
+                self.post("error", "This is group chat mode. Use /group, /profiles, /contacts, /disconnect, /logs, or /help.")
                 return
 
             if self.active_group:
@@ -2928,6 +2979,10 @@ class I2PChat(App):
 
         if msg.strip() in ("/groups", "/group-list"):
             self.post("system", "Use --groups for group administration.")
+            return
+
+        if msg.strip() in ("/profiles", "/contacts"):
+            self.open_profiles_screen()
             return
 
         if msg.startswith("/group"):
@@ -4053,7 +4108,15 @@ class I2PChat(App):
             invite = decode_group_invite_string(invite_text)
             meta = make_group_meta(invite.get("group_name") or "group", my_name)
             merge_group_invite(meta, invite)
-            key = self.group_store.save(meta)
+            key = group_storage_key(meta)
+            existing = self.group_store.find(key)
+            if existing and group_storage_key(existing).lower() == key.lower():
+                self.post("error", "Group already exists locally. Open the existing group instead.")
+                return
+            if group_runtime_is_locked(self.group_store, key):
+                self.post("error", "Group is already open in another instance.")
+                return
+            self.group_store.save(meta)
             self.post("success", f"Joined group record: {meta.get('name', 'group')}")
             self.post("system", f"Start group chat with: {os.path.basename(sys.argv[0])} --group {key}")
         except Exception as e:
@@ -4159,8 +4222,16 @@ class I2PChat(App):
             invite = decode_group_invite_string(invite_text)
             meta = make_group_meta(invite.get("group_name") or "group", my_name)
             merge_group_invite(meta, invite)
+            key = group_storage_key(meta)
+            existing = self.group_store.find(key)
+            if existing and group_storage_key(existing).lower() == key.lower():
+                self.post("error", "Group already exists locally. Open the existing group instead.")
+                return
+            if group_runtime_is_locked(self.group_store, key):
+                self.post("error", "Group is already open in another instance.")
+                return
             self.group_store.save(meta)
-            await self.open_group(group_storage_key(meta))
+            await self.open_group(key)
         except Exception as e:
             self.post("error", f"Group join failed: {e}")
 
@@ -4233,6 +4304,7 @@ class I2PChat(App):
             self.watch_peer_b32(self.peer_b32)
 
             self.group_accept_task = asyncio.create_task(self.group_accept_loop(key))
+            self.group_reconnect_task = asyncio.create_task(self.group_reconnect_loop(key))
             await self.connect_group_members()
             self.update_command_bar()
         except Exception as e:
@@ -4251,7 +4323,22 @@ class I2PChat(App):
                 pass
             self.group_accept_task = None
 
+        if self.group_reconnect_task:
+            self.group_reconnect_task.cancel()
+            try:
+                await self.group_reconnect_task
+            except:
+                pass
+            self.group_reconnect_task = None
+
         for peer in list(self.group_peers.values()):
+            connect_task = peer.get("connect_task")
+            if connect_task:
+                connect_task.cancel()
+                try:
+                    await connect_task
+                except:
+                    pass
             task = peer.get("task")
             if task:
                 task.cancel()
@@ -4261,9 +4348,9 @@ class I2PChat(App):
             writer = peer.get("writer")
             if writer is not None:
                 try:
-                    if peer.get("ready"):
-                        writer.write(self.frame_message("S", "__SIGNAL__:QUIT"))
-                        await writer.drain()
+                    writer.write(self.frame_message("S", "__SIGNAL__:QUIT"))
+                    await writer.drain()
+                    await asyncio.sleep(0.03)
                 except:
                     pass
                 try:
@@ -4367,6 +4454,13 @@ class I2PChat(App):
 
         peer = self.group_peers.get(member_b32)
         if peer:
+            connect_task = peer.get("connect_task")
+            if connect_task:
+                try:
+                    connect_task.cancel()
+                    await connect_task
+                except:
+                    pass
             writer = peer.get("writer")
             if writer is not None:
                 try:
@@ -4425,26 +4519,89 @@ class I2PChat(App):
             "e2e": E2E(pq_enabled=False),
             "reader": None,
             "writer": None,
+            "connect_task": None,
             "task": None,
             "heartbeat_task": None,
             "heartbeat_last_rx_ts": 0.0,
             "heartbeat_last_ping_ts": 0.0,
+            "connecting": False,
+            "last_connect_attempt_ts": 0.0,
         }
         self.group_peers[b32] = peer
         return peer
+
+
+    async def reconcile_group_peers(self):
+        if not self.active_group:
+            return
+
+        my_b32 = (self.active_group.get("my_b32") or "").lower()
+        members_by_b32 = {}
+        for member in self.active_group.get("members") or []:
+            normalized = normalize_member(member)
+            b32 = normalized["b32"].lower()
+            if b32 and b32 != my_b32:
+                members_by_b32[b32] = normalized
+
+        for peer_b32 in list(self.group_peers.keys()):
+            if peer_b32 in members_by_b32:
+                peer = self.group_peers[peer_b32]
+                peer["member"] = members_by_b32[peer_b32]
+                peer["authorized"] = True
+                continue
+
+            peer = self.group_peers.get(peer_b32)
+            if peer and not peer.get("authorized"):
+                continue
+
+            peer = self.group_peers.pop(peer_b32)
+            connect_task = peer.get("connect_task")
+            if connect_task:
+                connect_task.cancel()
+                try:
+                    await connect_task
+                except:
+                    pass
+            writer = peer.get("writer")
+            if writer is not None:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except:
+                    pass
+            task = peer.get("task")
+            if task:
+                task.cancel()
+            heartbeat_task = peer.get("heartbeat_task")
+            if heartbeat_task:
+                heartbeat_task.cancel()
+
+        for member in members_by_b32.values():
+            self.ensure_group_peer(member, authorized=True)
 
 
     async def connect_group_members(self):
         if not self.active_group:
             return
 
+        await self.reconcile_group_peers()
         my_b32 = (self.active_group.get("my_b32") or "").lower()
+        now = time.monotonic()
         for member in list(self.active_group.get("members") or []):
             normalized = normalize_member(member)
             if normalized["b32"].lower() == my_b32:
                 continue
-            self.ensure_group_peer(normalized, authorized=True)
-            asyncio.create_task(self.connect_group_peer(normalized["b32"]))
+            peer = self.ensure_group_peer(normalized, authorized=True)
+            if peer.get("ready") or peer.get("connecting") or peer.get("writer"):
+                continue
+            if (
+                peer.get("last_connect_attempt_ts")
+                and now - peer["last_connect_attempt_ts"] < GROUP_RECONNECT_INTERVAL
+            ):
+                continue
+            peer["connecting"] = True
+            peer["last_connect_attempt_ts"] = now
+            peer["connect_task"] = asyncio.create_task(self.connect_group_peer(normalized["b32"]))
 
 
     async def connect_group_peer(self, b32: str):
@@ -4458,13 +4615,33 @@ class I2PChat(App):
             reader, writer = await self.group_sam.stream_connect(b32)
             peer["reader"] = reader
             peer["writer"] = writer
+            peer["connecting"] = False
+            peer["ready"] = False
+            peer["heartbeat_last_rx_ts"] = 0.0
+            peer["heartbeat_last_ping_ts"] = 0.0
             await self.send_group_handshake(writer, peer["e2e"])
             peer["task"] = asyncio.create_task(self.group_receive_loop(b32.lower(), reader, writer))
             self.post("system", f"Group handshake sent: {peer['member']['name']}")
+        except asyncio.CancelledError:
+            peer["connecting"] = False
+            raise
         except Exception as e:
             self.post("status", f"Group connect failed for {peer['member']['name']}: {e}")
             peer["reader"] = None
             peer["writer"] = None
+            peer["connecting"] = False
+        finally:
+            if peer.get("connect_task") == asyncio.current_task():
+                peer["connect_task"] = None
+
+
+    async def group_reconnect_loop(self, group_key: str):
+        try:
+            while self.active_group_key == group_key and self.group_sam:
+                await asyncio.sleep(1.0)
+                await self.connect_group_members()
+        except asyncio.CancelledError:
+            pass
 
 
     async def send_group_handshake(self, writer, e2e: E2E):
@@ -4506,6 +4683,9 @@ class I2PChat(App):
                 peer["writer"] = writer
                 peer["ready"] = False
                 peer["e2e"] = E2E(pq_enabled=False)
+                peer["connecting"] = False
+                peer["heartbeat_last_rx_ts"] = 0.0
+                peer["heartbeat_last_ping_ts"] = 0.0
                 await self.send_group_handshake(writer, peer["e2e"])
                 peer["task"] = asyncio.create_task(self.group_receive_loop(peer_b32, reader, writer))
                 self.post("system", f"Group incoming connection: {member['name']}")
@@ -4539,6 +4719,7 @@ class I2PChat(App):
                 peer["reader"] = None
                 peer["writer"] = None
                 peer["ready"] = False
+                peer["connecting"] = False
                 task = peer.get("heartbeat_task")
                 if task:
                     task.cancel()
