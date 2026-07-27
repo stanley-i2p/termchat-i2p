@@ -694,6 +694,8 @@ class I2PChat(App):
         self.group_pub_dest_b64 = None
         self.group_accept_task = None
         self.group_reconnect_task = None
+        self.group_ready_task = None
+        self.group_publish_ready = False
         self.group_peers = {}
         self.group_pending_messages = {}
         self.group_runtime_lock = None
@@ -4261,8 +4263,8 @@ class I2PChat(App):
                 meta["my_dest_b64"] = group_dest_b64
                 self.group_pub_dest_b64 = group_pub_dest_b64
 
-            group_profile_name = f"group:{group_storage_key(meta)}"
-            self.group_session_id = f"chat_{self.sam_session_label(group_profile_name)}_{int(time.time())}"
+            session_b32 = self.group_sam.destination_to_b32(meta["my_dest_b64"])
+            self.group_session_id = f"chat_group_{session_b32[:6]}_{session_b32[-14:-8]}_{int(time.time())}"
             await self.group_sam.create_session(
                 self.group_session_id,
                 destination=meta["my_dest_b64"],
@@ -4304,8 +4306,7 @@ class I2PChat(App):
             self.watch_peer_b32(self.peer_b32)
 
             self.group_accept_task = asyncio.create_task(self.group_accept_loop(key))
-            self.group_reconnect_task = asyncio.create_task(self.group_reconnect_loop(key))
-            await self.connect_group_members()
+            self.group_ready_task = asyncio.create_task(self.group_ready_loop(key, my_b32))
             self.update_command_bar()
         except Exception as e:
             await self.close_group(quiet=True)
@@ -4330,6 +4331,14 @@ class I2PChat(App):
             except:
                 pass
             self.group_reconnect_task = None
+
+        if self.group_ready_task:
+            self.group_ready_task.cancel()
+            try:
+                await self.group_ready_task
+            except:
+                pass
+            self.group_ready_task = None
 
         for peer in list(self.group_peers.values()):
             connect_task = peer.get("connect_task")
@@ -4378,6 +4387,7 @@ class I2PChat(App):
         self.group_sam = None
         self.group_session_id = None
         self.group_pub_dest_b64 = None
+        self.group_publish_ready = False
         self.group_peers = {}
         self.group_pending_messages = {}
         if self.app_mode == "groups":
@@ -4581,7 +4591,7 @@ class I2PChat(App):
 
 
     async def connect_group_members(self):
-        if not self.active_group:
+        if not self.active_group or not self.group_publish_ready:
             return
 
         await self.reconcile_group_peers()
@@ -4640,6 +4650,28 @@ class I2PChat(App):
             while self.active_group_key == group_key and self.group_sam:
                 await asyncio.sleep(1.0)
                 await self.connect_group_members()
+        except asyncio.CancelledError:
+            pass
+
+
+    async def group_ready_loop(self, group_key: str, my_b32: str):
+        try:
+            while self.active_group_key == group_key and self.group_sam:
+                try:
+                    await asyncio.wait_for(self.group_sam.naming_lookup(my_b32), timeout=5.0)
+                    if self.active_group_key != group_key or not self.group_sam:
+                        return
+                    self.group_publish_ready = True
+                    self.network_status = "visible"
+                    self.watch_peer_b32(self.peer_b32)
+                    self.post("success", "Group tunnels confirmed. Starting group member connections.")
+                    self.group_reconnect_task = asyncio.create_task(self.group_reconnect_loop(group_key))
+                    await self.connect_group_members()
+                    return
+                except asyncio.TimeoutError:
+                    await asyncio.sleep(2.0)
+                except Exception:
+                    await asyncio.sleep(2.0)
         except asyncio.CancelledError:
             pass
 

@@ -145,62 +145,75 @@ class SAMClient:
     # STREAM CONNECT
     
     async def stream_connect(self, destination_b32):
+        writer = None
+        returned = False
         reader, writer = await asyncio.open_connection(
             self.sam_host, self.sam_port
         )
 
-        # HELLO
-        writer.write(b"HELLO VERSION MIN=3.0 MAX=3.2\n")
-        await writer.drain()
-        await reader.readline()
+        try:
+            # HELLO
+            writer.write(b"HELLO VERSION MIN=3.0 MAX=3.2\n")
+            await writer.drain()
+            await reader.readline()
 
-        cmd = f"STREAM CONNECT ID={self.session_id} DESTINATION={destination_b32}\n"
+            cmd = f"STREAM CONNECT ID={self.session_id} DESTINATION={destination_b32}\n"
 
-        if DEBUG:
-            print("[SAM CONNECT]", cmd.strip())
-        
-
-        writer.write(cmd.encode())
-        await writer.drain()
-
-        resp = await reader.readline()
-        resp_str = resp.decode().strip()
-
-        if DEBUG:
-            print("[SAM CONNECT RESP]", resp_str)
+            if DEBUG:
+                print("[SAM CONNECT]", cmd.strip())
             
 
+            writer.write(cmd.encode())
+            await writer.drain()
 
-        if "RESULT=OK" not in resp_str:
-            writer.close()
-            await writer.wait_closed()
-            raise RuntimeError(f"CONNECT failed: {resp_str}")
+            resp = await reader.readline()
+            resp_str = resp.decode().strip()
 
-        return reader, writer
+            if DEBUG:
+                print("[SAM CONNECT RESP]", resp_str)
+                
+
+            if "RESULT=OK" not in resp_str:
+                raise RuntimeError(f"CONNECT failed: {resp_str}")
+
+            returned = True
+            return reader, writer
+        finally:
+            if writer is not None and not returned:
+                writer.close()
+                await writer.wait_closed()
 
     
     # STREAM ACCEPT (server)
     
     async def stream_accept(self):
+        writer = None
+        returned = False
         reader, writer = await asyncio.open_connection(
             self.sam_host, self.sam_port
         )
 
-        writer.write(b"HELLO VERSION MIN=3.0 MAX=3.2\n")
-        await writer.drain()
-        await reader.readline()
+        try:
+            writer.write(b"HELLO VERSION MIN=3.0 MAX=3.2\n")
+            await writer.drain()
+            await reader.readline()
 
-        cmd = f"STREAM ACCEPT ID={self.session_id}\n"
+            cmd = f"STREAM ACCEPT ID={self.session_id}\n"
 
-        writer.write(cmd.encode())
-        await writer.drain()
+            writer.write(cmd.encode())
+            await writer.drain()
 
-        resp = await reader.readline()
+            resp = await reader.readline()
 
-        if b"RESULT=OK" not in resp:
-            raise RuntimeError(f"ACCEPT failed: {resp.decode()}")
+            if b"RESULT=OK" not in resp:
+                raise RuntimeError(f"ACCEPT failed: {resp.decode()}")
 
-        return reader, writer
+            returned = True
+            return reader, writer
+        finally:
+            if writer is not None and not returned:
+                writer.close()
+                await writer.wait_closed()
 
     
     # CLOSE
