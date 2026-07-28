@@ -13,7 +13,7 @@ import asyncio
 from textual.app import App, ComposeResult
 from textual import events
 from textual.screen import ModalScreen
-from textual.widgets import Input, Static
+from textual.widgets import Input, Static, TextArea
 from textual.containers import Container, ScrollableContainer
 from textual.reactive import reactive
 from datetime import datetime, timezone
@@ -558,7 +558,7 @@ FS_INSTANCE_COUNT = fs_runtime_enter(BASE_DIR)
 
 
 
-class ChatInput(Input):
+class CommandInput(Input):
     def _on_paste(self, event: events.Paste) -> None:
         if event.text:
             selection = self.selection
@@ -567,6 +567,10 @@ class ChatInput(Input):
             else:
                 self.replace(event.text, *selection)
         event.stop()
+
+
+class MessageComposer(TextArea):
+    pass
 
 
 class ChatEntryWidget(Static):
@@ -581,9 +585,9 @@ class ChatEntryWidget(Static):
         event.stop()
 
 
-class I2PChat(App):
+class TermchatI2P(App):
     # This maps "q" or "ctrl+q" to the action "quit"
-    BINDINGS = [("q", "quit", "Quit"), ("ctrl+q", "quit", "Quit"), ("c", "copy_focused_bubble", "Copy Bubble"), ("r", "reply_to_focused_bubble", "Reply")]
+    BINDINGS = [("q", "quit", "Quit"), ("ctrl+q", "quit", "Quit"), ("c", "copy_focused_bubble", "Copy Bubble"), ("r", "reply_to_focused_bubble", "Reply"), ("alt+s", "send_message_composer", "Send Message"), ("f5", "send_message_composer", "Send Message")]
         
     CSS = """
     #status_bar {
@@ -597,7 +601,7 @@ class I2PChat(App):
 
     #bottom_bar {
         dock: bottom;
-        height: 4;
+        height: 8;
         layout: vertical;
         background: $surface;
     }
@@ -610,8 +614,28 @@ class I2PChat(App):
         color: $text;
     }
 
-    #chat_input {
-        height: 3;
+    #command_input {
+        height: 1;
+        border: none;
+        padding: 0;
+        margin: 0 1;
+        background: #3a3a3a;
+    }
+
+    #message_composer {
+        height: 6;
+        border: solid #5f5f5f;
+        background: $surface;
+    }
+
+    #message_composer:focus {
+        border: solid cyan;
+        background: $boost;
+    }
+
+    #message_composer:disabled {
+        border: solid #3a3a3a;
+        color: #5f5f5f;
     }
     
 
@@ -628,7 +652,7 @@ class I2PChat(App):
     }
 
     ChatEntryWidget:focus {
-        background: $boost;
+        background: #303030;
     }
     """
     
@@ -787,7 +811,14 @@ class I2PChat(App):
         yield ScrollableContainer(id="chat_window")
 
         with Container(id="bottom_bar"):
-            yield ChatInput(placeholder="Type message and press Enter...", id="chat_input")
+            yield MessageComposer(
+                placeholder="Message composer disabled until a peer or group is connected...",
+                id="message_composer",
+                show_line_numbers=False,
+                soft_wrap=True,
+                disabled=True,
+            )
+            yield CommandInput(placeholder="Type command and press Enter...", id="command_input")
             yield Static(id="command_bar")
         
 
@@ -829,7 +860,7 @@ class I2PChat(App):
                 hints.append("/lock")
 
         elif self.offline_mode:
-            hints = ["/online", "send message", "/logs", "/help"]
+            hints = ["/online", "/logs", "/help"]
 
             if self.is_persistent_mode():
                 hints.append("/dd")
@@ -855,6 +886,7 @@ class I2PChat(App):
         try:
             hints = self.get_command_hints()
             self.query_one("#command_bar").update(f"[dim]{hints}[/]")
+            self.update_message_composer_state()
         except:
             pass
         
@@ -1085,7 +1117,61 @@ class I2PChat(App):
             "quote": quote,
         }
         self.update_command_bar()
-        self.query_one("#chat_input", Input).focus()
+        if self.message_composer_enabled():
+            self.query_one("#message_composer", TextArea).focus()
+        else:
+            self.query_one("#command_input", Input).focus()
+
+
+    def message_composer_enabled(self) -> bool:
+        if self.active_group:
+            return any(
+                peer.get("ready") and peer.get("authorized") and peer.get("writer")
+                for peer in self.group_peers.values()
+            )
+        return bool(self.conn and self.live_ready)
+
+
+    def update_message_composer_state(self) -> None:
+        try:
+            composer = self.query_one("#message_composer", TextArea)
+        except:
+            return
+
+        enabled = self.message_composer_enabled()
+        composer.disabled = not enabled
+        if enabled:
+            composer.placeholder = "Type multiline message. Alt+S or F5 to send."
+        else:
+            composer.placeholder = "Message composer disabled until a peer or group is connected..."
+
+
+    def action_send_message_composer(self) -> None:
+        self.run_worker(self.send_message_composer())
+
+
+    async def send_message_composer(self):
+        composer = self.query_one("#message_composer", TextArea)
+        if not self.message_composer_enabled():
+            self.post("error", "Message composer is disabled until a peer or group is connected.")
+            return
+
+        message = composer.text.strip()
+        if not message:
+            return
+
+        composer.clear()
+        if self.active_group:
+            message = self.apply_reply_target(message)
+            await self.send_group_message(message)
+            return
+
+        if self.conn and self.live_ready:
+            message = self.apply_reply_target(message)
+            await self.send_direct_message(message)
+            return
+
+        self.post("error", "No active connection.")
 
 
     def focused_chat_entry(self):
@@ -1185,14 +1271,14 @@ class I2PChat(App):
             if event.key == "enter":
                 event.prevent_default()
                 event.stop()
-                self.query_one("#chat_input", Input).focus()
+                self.query_one("#command_input", Input).focus()
                 return
 
         if event.key not in ("up", "down"):
             return
 
         #input_widget = self.query_one(Input)
-        input_widget = self.query_one("#chat_input", Input)
+        input_widget = self.query_one("#command_input", Input)
 
         if not input_widget.has_focus:
             return
@@ -1235,7 +1321,8 @@ class I2PChat(App):
      
 
     def format_chat_message(self, message: str) -> str:
-        safe_message = re.sub(r'[\x00-\x1F\x7F]', '', str(message))
+        normalized = str(message).replace("\r\n", "\n").replace("\r", "\n")
+        safe_message = re.sub(r'[\x00-\x09\x0B-\x1F\x7F]', '', normalized)
         safe_message = escape(safe_message)
 
         address_pattern = r"([a-z0-9]+\.b32\.i2p|[a-z0-9]+\.i2p)"
@@ -1415,6 +1502,36 @@ class I2PChat(App):
     def append_log_entry(self, content: str):
         self.log_history.append(content)
         return content
+
+
+    async def send_direct_message(self, message: str):
+        msg_id = None
+        try:
+            _, writer = self.conn
+
+            cipher = self.e2e.encrypt(message.encode())
+            frame = self.frame_message('U', cipher)
+            msg_id = struct.unpack(">Q", frame[6:14])[0]
+            pending_entry = {
+                "kind": "bubble",
+                "type": "me",
+                "message": message,
+                "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "msg_id": msg_id,
+                "delivered": False,
+            }
+            self.pending_messages[msg_id] = pending_entry
+
+            writer.write(frame)
+            await writer.drain()
+
+            self.append_chat_entry(pending_entry)
+        except Exception:
+            if msg_id is not None:
+                self.pending_messages.pop(msg_id, None)
+            self.post("error", "Failed to send message.")
+            self.conn = None
+            self.live_ready = False
 
 
     def show_logs(self):
@@ -3043,8 +3160,7 @@ class I2PChat(App):
                     self.post("error", "Group chat supports /group, /profiles, /contacts, /disconnect, /logs, and /help.")
                     return
 
-                msg = self.apply_reply_target(msg)
-                await self.send_group_message(msg)
+                self.post("error", "Use the message composer above the command line to send chat text.")
                 return
 
             if msg.strip() == "/admin":
@@ -3086,8 +3202,7 @@ class I2PChat(App):
                 return
 
             if self.active_group:
-                msg = self.apply_reply_target(msg)
-                await self.send_group_message(msg)
+                self.post("error", "Use the message composer above the command line to send chat text.")
             else:
                 self.post("error", "Group is not ready.")
             return
@@ -3422,82 +3537,17 @@ class I2PChat(App):
 
 
         elif self.active_group:
-            msg = self.apply_reply_target(msg)
-            await self.send_group_message(msg)
+            self.post("error", "Use the message composer above the command line to send chat text.")
             
             
         elif self.conn and self.live_ready:
-            msg = self.apply_reply_target(msg)
-            msg_id = None
-            try:
-                _, writer = self.conn
-                
-                cipher = self.e2e.encrypt(msg.encode())
-                frame = self.frame_message('U', cipher)
-                msg_id = struct.unpack(">Q", frame[6:14])[0]
-                pending_entry = {
-                    "kind": "bubble",
-                    "type": "me",
-                    "message": msg,
-                    "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                    "msg_id": msg_id,
-                    "delivered": False,
-                }
-                self.pending_messages[msg_id] = pending_entry
-                
-                writer.write(frame)
-                await writer.drain()
-                
-
-                self.append_chat_entry(pending_entry)
-            except Exception:
-                if msg_id is not None:
-                    self.pending_messages.pop(msg_id, None)
-                self.post("error", "Failed to send message.")
-                self.conn = None
-                self.live_ready = False
+            self.post("error", "Use the message composer above the command line to send chat text.")
                 
         elif self.conn and not self.live_ready:
             self.post("error", "Live connection is not ready yet. Wait for secure session to be established.")
                 
         elif self.offline_ready() and self.offline_mode:
-            msg = self.apply_reply_target(msg)
-            try:
-                blob_key = self.get_offline_blob_key()
-                frame = self.frame_message('U', msg.encode())
-                msg_id = struct.unpack(">Q", frame[6:14])[0]
-                blob = self.e2e.encrypt_offline_blob(frame, blob_key)
-                pending_entry = {
-                    "kind": "bubble",
-                    "type": "me_offline",
-                    "message": msg,
-                    "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                    "msg_id": msg_id,
-                    "delivered": False,
-                }
-                self.append_chat_entry(pending_entry)
-
-                send_index = self.drop_send_index
-                dd_key = self.derive_deaddrop_key("send", send_index)
-
-                status, ok_drops = await self.deaddrop.put(dd_key, blob)
-
-                if status in ("OK", "EXISTS"):
-                    if ok_drops:
-                        self.prefer_deaddrop_server(ok_drops[0])
-
-                    self.drop_send_index += 1
-                    self.save_offline_state()
-                    self.set_dd_status("put_ok")
-                    self.mark_chat_entry_delivered(pending_entry)
-                    #self.post("system", f"[OFFLINE] queued and replicated via deaddrops key_index={send_index}")
-                else:
-                    self.set_dd_status("put_fail")
-                    self.post("error", "[OFFLINE send failed] deaddrop PUT did not succeed")
-
-            except Exception as e:
-                self.set_dd_status("put_fail")
-                self.post("error", f"[OFFLINE send failed] {e}")
+            self.post("error", "Use the message composer above the command line to send chat text.")
                 
                 
         else:
@@ -5717,7 +5767,7 @@ if __name__ == "__main__":
     app = None
 
     try:
-        app = I2PChat()
+        app = TermchatI2P()
         app.run()
     finally:
         if app is not None:
