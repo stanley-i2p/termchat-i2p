@@ -88,6 +88,7 @@ MAX_FILENAME = 128
 IMAGE_RENDER_WIDTH = 60
 IMAGE_TRANSFER_MAX_DIMENSION = 1280
 IMAGE_TRANSFER_JPEG_QUALITY = 82
+GROUP_IMAGE_TRANSFER_MAX_BYTES = 2 * 1024 * 1024
 
 Image.MAX_IMAGE_PIXELS = 20_000_000
 
@@ -1419,7 +1420,12 @@ class TermchatI2P(App):
 
         if entry.get("kind") == "image":
             delivery = ""
-            if entry.get("msg_id") is not None and entry.get("delivered"):
+            expected = entry.get("group_expected_acks") or []
+            received = entry.get("group_received_acks") or []
+            if expected:
+                mark = "✓✓" if len(received) >= len(expected) else "✓"
+                delivery = f" [dim green]{mark} {len(received)}/{len(expected)}[/]"
+            elif entry.get("msg_id") is not None and entry.get("delivered"):
                 delivery = " [dim green]✓✓[/]"
 
             image_content = Text.from_markup(entry["content"]) if entry.get("markup") else Text(entry["content"], style="bright_white")
@@ -1820,13 +1826,17 @@ class TermchatI2P(App):
             if not path:
                 return
 
-            if not self.conn:
-                self.post("error", "No active connection. Use /connect <address>.")
-                return
-
             if image_mode:
-                self.run_worker(self.send_image(path, mode=image_mode))
+                if self.active_group:
+                    self.run_worker(self.send_group_image(path, mode=image_mode))
+                elif self.conn:
+                    self.run_worker(self.send_image(path, mode=image_mode))
+                else:
+                    self.post("error", "No active connection. Use /connect <address>.")
             else:
+                if not self.conn:
+                    self.post("error", "No active connection. Use /connect <address>.")
+                    return
                 self.run_worker(self.send_file(path))
 
         self.push_screen(
@@ -3148,6 +3158,36 @@ class TermchatI2P(App):
                     self.open_active_group_screen()
                     return
 
+                if msg.strip() == "/img":
+                    self.open_file_picker(image_mode="braille")
+                    return
+
+                if msg.startswith("/img "):
+                    path = msg[5:].strip()
+                    if not path:
+                        self.open_file_picker(image_mode="braille")
+                        return
+                    if not os.path.exists(path):
+                        self.post("error", f"File not found: {path}")
+                        return
+                    await self.send_group_image(path, mode="braille")
+                    return
+
+                if msg.strip() == "/img-bw":
+                    self.open_file_picker(image_mode="bw")
+                    return
+
+                if msg.startswith("/img-bw "):
+                    path = msg[7:].strip()
+                    if not path:
+                        self.open_file_picker(image_mode="bw")
+                        return
+                    if not os.path.exists(path):
+                        self.post("error", f"File not found: {path}")
+                        return
+                    await self.send_group_image(path, mode="bw")
+                    return
+
                 if msg.strip() in ("/log", "/logs"):
                     self.show_logs()
                     return
@@ -3157,7 +3197,7 @@ class TermchatI2P(App):
                     return
 
                 if msg.startswith("/"):
-                    self.post("error", "Group chat supports /group, /profiles, /contacts, /disconnect, /logs, and /help.")
+                    self.post("error", "Group chat supports /group, /profiles, /contacts, /img, /img-bw, /disconnect, /logs, and /help.")
                     return
 
                 self.post("error", "Use the message composer above the command line to send chat text.")
@@ -3189,6 +3229,36 @@ class TermchatI2P(App):
                 self.open_active_group_screen()
                 return
 
+            if msg.strip() == "/img":
+                self.open_file_picker(image_mode="braille")
+                return
+
+            if msg.startswith("/img "):
+                path = msg[5:].strip()
+                if not path:
+                    self.open_file_picker(image_mode="braille")
+                    return
+                if not os.path.exists(path):
+                    self.post("error", f"File not found: {path}")
+                    return
+                await self.send_group_image(path, mode="braille")
+                return
+
+            if msg.strip() == "/img-bw":
+                self.open_file_picker(image_mode="bw")
+                return
+
+            if msg.startswith("/img-bw "):
+                path = msg[7:].strip()
+                if not path:
+                    self.open_file_picker(image_mode="bw")
+                    return
+                if not os.path.exists(path):
+                    self.post("error", f"File not found: {path}")
+                    return
+                await self.send_group_image(path, mode="bw")
+                return
+
             if msg.strip() in ("/log", "/logs"):
                 self.show_logs()
                 return
@@ -3198,7 +3268,7 @@ class TermchatI2P(App):
                 return
 
             if msg.startswith("/"):
-                self.post("error", "This is group chat mode. Use /group, /profiles, /contacts, /disconnect, /logs, or /help.")
+                self.post("error", "This is group chat mode. Use /group, /profiles, /contacts, /img, /img-bw, /disconnect, /logs, or /help.")
                 return
 
             if self.active_group:
@@ -3399,7 +3469,7 @@ class TermchatI2P(App):
         
         
         elif msg.strip() == "/img":
-            if not self.conn:
+            if not self.active_group and not self.conn:
                 self.post("error", "No active connection. Use /connect <address>.")
                 return
             
@@ -3408,7 +3478,7 @@ class TermchatI2P(App):
         
         
         elif msg.startswith("/img "):
-            if not self.conn:
+            if not self.active_group and not self.conn:
                 self.post("error", "No active connection. Use /connect <address>.")
                 return
             
@@ -3421,11 +3491,14 @@ class TermchatI2P(App):
                 self.post("error", f"File not found: {path}")
                 return
 
-            await self.send_image(path, mode="braille")
+            if self.active_group:
+                await self.send_group_image(path, mode="braille")
+            else:
+                await self.send_image(path, mode="braille")
             
             
         elif msg.strip() == "/img-bw":
-            if not self.conn:
+            if not self.active_group and not self.conn:
                 self.post("error", "No active connection. Use /connect <address>.")
                 return
             
@@ -3433,7 +3506,7 @@ class TermchatI2P(App):
             
             
         elif msg.startswith("/img-bw "):
-            if not self.conn:
+            if not self.active_group and not self.conn:
                 self.post("error", "No active connection. Use /connect <address>.")
                 return
             
@@ -3446,7 +3519,10 @@ class TermchatI2P(App):
                 self.post("error", f"File not found: {path}")
                 return
 
-            await self.send_image(path, mode="bw")
+            if self.active_group:
+                await self.send_group_image(path, mode="bw")
+            else:
+                await self.send_image(path, mode="bw")
         
         
         
@@ -4762,9 +4838,52 @@ class TermchatI2P(App):
             "heartbeat_last_ping_ts": 0.0,
             "connecting": False,
             "last_connect_attempt_ts": 0.0,
+            "incoming_image_name": None,
+            "incoming_image_mime": None,
+            "incoming_image_expected": 0,
+            "incoming_image_received": 0,
+            "incoming_image_msg_id": 0,
+            "incoming_image_bytes": bytearray(),
         }
         self.group_peers[b32] = peer
         return peer
+
+
+    def clear_group_peer_incoming_image_state(self, peer: dict):
+        peer["incoming_image_name"] = None
+        peer["incoming_image_mime"] = None
+        peer["incoming_image_expected"] = 0
+        peer["incoming_image_received"] = 0
+        peer["incoming_image_msg_id"] = 0
+        peer["incoming_image_bytes"] = bytearray()
+
+
+    def group_local_prefers_outbound(self, peer_b32: str) -> bool:
+        if not self.active_group:
+            return False
+        my_b32 = (self.active_group.get("my_b32") or "").lower()
+        return bool(my_b32) and my_b32 < (peer_b32 or "").lower()
+
+
+    async def close_group_writer(self, writer):
+        if writer is None:
+            return
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except:
+            pass
+
+
+    def cancel_group_peer_runtime_tasks(self, peer: dict):
+        task = peer.get("task")
+        if task:
+            task.cancel()
+            peer["task"] = None
+        heartbeat_task = peer.get("heartbeat_task")
+        if heartbeat_task:
+            heartbeat_task.cancel()
+            peer["heartbeat_task"] = None
 
 
     async def reconcile_group_peers(self):
@@ -4843,20 +4962,51 @@ class TermchatI2P(App):
     async def connect_group_peer(self, b32: str):
         if not self.active_group or not self.group_sam:
             return
-        peer = self.group_peers.get(b32.lower())
-        if not peer or peer.get("writer"):
+        peer_b32 = b32.lower()
+        peer = self.group_peers.get(peer_b32)
+        if not peer:
+            return
+        if peer.get("writer"):
+            peer["connecting"] = False
+            if peer.get("connect_task") == asyncio.current_task():
+                peer["connect_task"] = None
             return
 
         try:
             reader, writer = await self.group_sam.stream_connect(b32)
+            peer = self.group_peers.get(peer_b32)
+            if not self.active_group or not peer:
+                await self.close_group_writer(writer)
+                return
+
+            prefer_outbound = self.group_local_prefers_outbound(peer_b32)
+            existing_writer = peer.get("writer")
+            if peer.get("ready") and existing_writer is not None:
+                peer["connecting"] = False
+                await self.close_group_writer(writer)
+                self.post("system", f"Group connection collision: kept ready session with {peer['member']['name']}.")
+                return
+            if existing_writer is not None and not prefer_outbound:
+                peer["connecting"] = False
+                await self.close_group_writer(writer)
+                self.post("system", f"Group connection collision: kept inbound session with {peer['member']['name']}.")
+                return
+
+            old_writer = existing_writer
+            if old_writer is not None:
+                self.cancel_group_peer_runtime_tasks(peer)
+                self.post("system", f"Group connection collision: kept outbound session with {peer['member']['name']}.")
             peer["reader"] = reader
             peer["writer"] = writer
             peer["connecting"] = False
             peer["ready"] = False
+            peer["e2e"] = E2E(pq_enabled=False)
             peer["heartbeat_last_rx_ts"] = 0.0
             peer["heartbeat_last_ping_ts"] = 0.0
             await self.send_group_handshake(writer, peer["e2e"])
-            peer["task"] = asyncio.create_task(self.group_receive_loop(b32.lower(), reader, writer))
+            peer["task"] = asyncio.create_task(self.group_receive_loop(peer_b32, reader, writer))
+            if old_writer is not None:
+                await self.close_group_writer(old_writer)
             self.post("system", f"Group handshake sent: {peer['member']['name']}")
         except asyncio.CancelledError:
             peer["connecting"] = False
@@ -4867,7 +5017,7 @@ class TermchatI2P(App):
             peer["writer"] = None
             peer["connecting"] = False
         finally:
-            if peer.get("connect_task") == asyncio.current_task():
+            if peer and peer.get("connect_task") == asyncio.current_task():
                 peer["connect_task"] = None
 
 
@@ -4937,6 +5087,25 @@ class TermchatI2P(App):
                     member = {"name": f"member-{peer_b32[:8]}", "b32": peer_b32}
 
                 peer = self.ensure_group_peer(member, authorized=authorized)
+                prefer_outbound = self.group_local_prefers_outbound(peer_b32)
+                existing_writer = peer.get("writer")
+                has_collision = existing_writer is not None or peer.get("connecting")
+                if peer.get("ready") and existing_writer is not None:
+                    await self.close_group_writer(writer)
+                    self.post("system", f"Group connection collision: kept ready session with {peer['member']['name']}.")
+                    continue
+                if has_collision and prefer_outbound:
+                    await self.close_group_writer(writer)
+                    self.post("system", f"Group connection collision: kept outbound session with {peer['member']['name']}.")
+                    continue
+
+                old_writer = existing_writer
+                if old_writer is not None:
+                    self.cancel_group_peer_runtime_tasks(peer)
+                    self.post("system", f"Group connection collision: kept inbound session with {peer['member']['name']}.")
+                connect_task = peer.get("connect_task")
+                if connect_task and not connect_task.done():
+                    connect_task.cancel()
                 peer["reader"] = reader
                 peer["writer"] = writer
                 peer["ready"] = False
@@ -4946,6 +5115,8 @@ class TermchatI2P(App):
                 peer["heartbeat_last_ping_ts"] = 0.0
                 await self.send_group_handshake(writer, peer["e2e"])
                 peer["task"] = asyncio.create_task(self.group_receive_loop(peer_b32, reader, writer))
+                if old_writer is not None:
+                    await self.close_group_writer(old_writer)
                 self.post("system", f"Group incoming connection: {member['name']}")
             except asyncio.CancelledError:
                 break
@@ -5042,6 +5213,108 @@ class TermchatI2P(App):
                 return
             delivered_id = struct.unpack(">Q", payload)[0]
             self.mark_group_message_delivered(delivered_id, peer_b32)
+            return
+
+        if msg_type in ("J", "G", "Z"):
+            if not peer.get("ready") or not peer.get("authorized"):
+                return
+
+            if msg_type == "J":
+                try:
+                    plain = peer["e2e"].decrypt(payload)
+                    parts = plain.decode("utf-8", errors="ignore").split("|", 2)
+                    if len(parts) != 3:
+                        self.post("error", f"Invalid group image header from {peer['member']['name']}.")
+                        return
+
+                    filename = os.path.basename(parts[0])[:MAX_FILENAME] or "image"
+                    mime = parts[1].strip()
+                    total = int(parts[2])
+
+                    if total <= 0 or total > GROUP_IMAGE_TRANSFER_MAX_BYTES:
+                        self.post("error", f"Rejected group image size from {peer['member']['name']}: {total} bytes.")
+                        return
+
+                    if not self.is_supported_image_mime(mime):
+                        self.post("error", f"Unsupported group image type from {peer['member']['name']}: {mime}")
+                        return
+
+                    self.clear_group_peer_incoming_image_state(peer)
+                    peer["incoming_image_name"] = filename
+                    peer["incoming_image_mime"] = mime
+                    peer["incoming_image_expected"] = total
+                    peer["incoming_image_received"] = 0
+                    peer["incoming_image_msg_id"] = msg_id
+                    peer["incoming_image_bytes"] = bytearray()
+                except Exception as e:
+                    self.post("error", f"Invalid group image header from {peer['member']['name']}: {e}")
+                return
+
+            if msg_type == "G":
+                try:
+                    if not peer.get("incoming_image_name"):
+                        self.post("error", f"Group image chunk without header from {peer['member']['name']}.")
+                        return
+
+                    if peer.get("incoming_image_msg_id") != msg_id:
+                        self.post("error", f"Group image chunk transfer id mismatch from {peer['member']['name']}.")
+                        return
+
+                    plain = peer["e2e"].decrypt(payload)
+                    chunk = base64.b64decode(plain, validate=True)
+                    next_total = peer.get("incoming_image_received", 0) + len(chunk)
+
+                    if next_total > peer.get("incoming_image_expected", 0) or next_total > GROUP_IMAGE_TRANSFER_MAX_BYTES:
+                        self.post("error", f"Group image transfer overflow from {peer['member']['name']}.")
+                        self.clear_group_peer_incoming_image_state(peer)
+                        return
+
+                    peer["incoming_image_bytes"].extend(chunk)
+                    peer["incoming_image_received"] = next_total
+                except Exception as e:
+                    self.post("error", f"Group image chunk decode failed from {peer['member']['name']}: {e}")
+                    self.clear_group_peer_incoming_image_state(peer)
+                return
+
+            try:
+                if not peer.get("incoming_image_name"):
+                    self.post("error", f"Group image end without header from {peer['member']['name']}.")
+                    return
+
+                if peer.get("incoming_image_msg_id") != msg_id:
+                    self.post("error", f"Group image end transfer id mismatch from {peer['member']['name']}.")
+                    return
+
+                if peer.get("incoming_image_received") != peer.get("incoming_image_expected"):
+                    self.post(
+                        "error",
+                        f"Incomplete group image from {peer['member']['name']}: "
+                        f"{peer.get('incoming_image_received')}/{peer.get('incoming_image_expected')} bytes."
+                    )
+                    self.clear_group_peer_incoming_image_state(peer)
+                    return
+
+                image_mime = peer.get("incoming_image_mime") or "image/png"
+                image_bytes = bytes(peer.get("incoming_image_bytes") or b"")
+                img_text = self.render_image_bytes_for_terminal(image_bytes, image_mime)
+
+                self.append_chat_entry({
+                    "kind": "image",
+                    "content": img_text,
+                    "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                    "display": peer["member"].get("name", "member"),
+                    "color": "cyan",
+                    "alignment": "right",
+                    "msg_id": msg_id,
+                    "markup": True,
+                })
+
+                self.clear_group_peer_incoming_image_state(peer)
+                writer.write(self.frame_message("D", struct.pack(">Q", msg_id)))
+                await writer.drain()
+            except Exception as e:
+                self.post("error", f"Group image receive failed from {peer['member']['name']}: {e}")
+                self.clear_group_peer_incoming_image_state(peer)
             return
 
         if msg_type not in ("U", "L"):
@@ -5279,6 +5552,103 @@ class TermchatI2P(App):
         else:
             self.group_pending_messages.pop(msg_id, None)
             self.post("error", "Group send failed.")
+
+
+    async def send_group_image(self, path, mode="braille"):
+        if not self.active_group:
+            self.post("error", "No group is open.")
+            return
+
+        ready_peers = [
+            (peer_b32, peer)
+            for peer_b32, peer in self.group_peers.items()
+            if peer.get("ready") and peer.get("authorized") and peer.get("writer")
+        ]
+
+        if not ready_peers:
+            self.post("error", "No ready group members. Wait for group sessions to connect.")
+            return
+
+        if self.image_mime_for_path(path) is None:
+            self.post("error", "Unsupported image type.")
+            return
+
+        msg_id = None
+
+        try:
+            image_bytes, mime = self.prepare_image_preview_bytes(path)
+
+            if not image_bytes:
+                self.post("error", "Image preview is empty.")
+                return
+
+            if len(image_bytes) > GROUP_IMAGE_TRANSFER_MAX_BYTES:
+                self.post(
+                    "error",
+                    f"Group image preview too large ({len(image_bytes)} bytes). "
+                    f"Maximum is {GROUP_IMAGE_TRANSFER_MAX_BYTES} bytes."
+                )
+                return
+
+            img_text = self.render_image_bytes_for_terminal(image_bytes, mime, mode=mode)
+            filename = os.path.basename(path).replace("|", "_")[:MAX_FILENAME] or "image"
+            msg_id = self.generate_msg_id()
+            expected = [peer_b32 for peer_b32, _ in ready_peers]
+            entry = {
+                "kind": "image",
+                "content": img_text,
+                "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "display": "Me",
+                "color": "green",
+                "alignment": "left",
+                "msg_id": msg_id,
+                "delivered": False,
+                "markup": mode != "bw",
+                "group_expected_acks": expected,
+                "group_received_acks": [],
+            }
+            self.group_pending_messages[msg_id] = entry
+
+            header = f"{filename}|{mime}|{len(image_bytes)}"
+            sent_any = False
+            for _, peer in ready_peers:
+                try:
+                    peer["writer"].write(
+                        self.frame_message(
+                            "J",
+                            peer["e2e"].encrypt(header.encode("utf-8")),
+                            msg_id=msg_id,
+                        )
+                    )
+
+                    for start in range(0, len(image_bytes), 4096):
+                        chunk = image_bytes[start:start + 4096]
+                        encoded = base64.b64encode(chunk)
+                        peer["writer"].write(
+                            self.frame_message(
+                                "G",
+                                peer["e2e"].encrypt(encoded),
+                                msg_id=msg_id,
+                            )
+                        )
+
+                    peer["writer"].write(self.frame_message("Z", b"", msg_id=msg_id))
+                    await peer["writer"].drain()
+                    sent_any = True
+                except Exception as e:
+                    self.post("status", f"Group image send failed for {peer['member']['name']}: {e}")
+
+            if sent_any:
+                self.append_chat_entry(entry)
+                self.post("success", f"Group image sent: {path}")
+            else:
+                self.group_pending_messages.pop(msg_id, None)
+                self.post("error", "Group image send failed.")
+
+        except Exception as e:
+            if msg_id is not None:
+                self.group_pending_messages.pop(msg_id, None)
+            self.post("error", f"Group image send failed: {e}")
 
 
     def mark_group_message_delivered(self, delivered_id: int, peer_b32: str):
