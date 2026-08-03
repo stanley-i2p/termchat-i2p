@@ -68,6 +68,7 @@ from help_screen import HELP_LINES, HelpScreen
 from logs_screen import LogsScreen
 from profiles_screen import ProfilesScreen
 from sam_client import SAMClient
+from sam_runtime import SamRuntimeClosed, SamSessionManager
 
 from vault import fs_decrypt, fs_encrypt, fs_runtime_enter, fs_runtime_leave, fs_verify_passphrase
 
@@ -103,6 +104,7 @@ HEARTBEAT_PING_INTERVAL = 10.0
 HEARTBEAT_TIMEOUT = 35.0
 HEARTBEAT_PING_PREFIX = "__SIGNAL__:PING:"
 HEARTBEAT_PONG_PREFIX = "__SIGNAL__:PONG:"
+OFFLINE_SECRET_REQUEST_SIGNAL = "__SIGNAL__:OFFLINE_SECRET_REQUEST"
 GROUP_RECONNECT_INTERVAL = 5.0
 
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".termchat-i2p")
@@ -679,7 +681,8 @@ class TermchatI2P(App):
         self.publish_ready = False
         
         
-        self.sam = SAMClient(self.sam_address[0], self.sam_address[1])
+        self.sam_runtime = SamSessionManager(self.sam_address[0], self.sam_address[1])
+        self.sam = self.sam_runtime.client
         
         self.stored_peer = None
         self.stored_peer_dest_b64 = None
@@ -737,6 +740,7 @@ class TermchatI2P(App):
         self.group_store = GroupStore(BASE_DIR)
         self.active_group_key = None
         self.active_group = None
+        self.group_sam_runtime = None
         self.group_sam = None
         self.group_session_id = None
         self.group_pub_dest_b64 = None
@@ -859,6 +863,8 @@ class TermchatI2P(App):
 
             if self.is_persistent_mode() and not self.stored_peer:
                 hints.append("/lock")
+            elif self.is_persistent_mode() and self.stored_peer:
+                hints.append("/unlock")
 
         elif self.offline_mode:
             hints = ["/online", "/logs", "/help"]
@@ -874,6 +880,8 @@ class TermchatI2P(App):
 
             if self.is_persistent_mode():
                 hints.append("/dd")
+                if self.stored_peer:
+                    hints.append("/unlock")
 
         if self.reply_target:
             hints.insert(0, f"replying to {escape(self.reply_target['author'])}")
@@ -1130,6 +1138,8 @@ class TermchatI2P(App):
                 peer.get("ready") and peer.get("authorized") and peer.get("writer")
                 for peer in self.group_peers.values()
             )
+        if self.offline_ready() and self.offline_mode:
+            return True
         return bool(self.conn and self.live_ready)
 
 
@@ -1144,7 +1154,7 @@ class TermchatI2P(App):
         if enabled:
             composer.placeholder = "Type multiline message. Alt+S or F5 to send."
         else:
-            composer.placeholder = "Message composer disabled until a peer or group is connected..."
+            composer.placeholder = "Message composer disabled until a peer, group, or offline mode is ready..."
 
 
     def action_send_message_composer(self) -> None:
@@ -1154,7 +1164,7 @@ class TermchatI2P(App):
     async def send_message_composer(self):
         composer = self.query_one("#message_composer", TextArea)
         if not self.message_composer_enabled():
-            self.post("error", "Message composer is disabled until a peer or group is connected.")
+            self.post("error", "Message composer is disabled until a peer, group, or offline mode is ready.")
             return
 
         message = composer.text.strip()
@@ -1170,6 +1180,11 @@ class TermchatI2P(App):
         if self.conn and self.live_ready:
             message = self.apply_reply_target(message)
             await self.send_direct_message(message)
+            return
+
+        if self.offline_ready() and self.offline_mode:
+            message = self.apply_reply_target(message)
+            await self.send_offline_message(message)
             return
 
         self.post("error", "No active connection.")
@@ -1511,6 +1526,13 @@ class TermchatI2P(App):
 
 
     async def send_direct_message(self, message: str):
+        if self.sam_runtime and self.sam_runtime.is_closing():
+            self.post("error", "Cannot send while chat is closing.")
+            return
+        current_task = asyncio.current_task()
+        if self.sam_runtime and current_task:
+            self.sam_runtime.track_send_task(current_task)
+
         msg_id = None
         try:
             _, writer = self.conn
@@ -1538,6 +1560,47 @@ class TermchatI2P(App):
             self.post("error", "Failed to send message.")
             self.conn = None
             self.live_ready = False
+
+
+    async def send_offline_message(self, message: str):
+        if not self.offline_ready() or not self.offline_mode:
+            self.post("error", "Offline mode is not ready.")
+            return
+
+        try:
+            blob_key = self.get_offline_blob_key()
+            frame = self.frame_message('U', message.encode())
+            msg_id = struct.unpack(">Q", frame[6:14])[0]
+            blob = self.e2e.encrypt_offline_blob(frame, blob_key)
+            pending_entry = {
+                "kind": "bubble",
+                "type": "me_offline",
+                "message": message,
+                "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "msg_id": msg_id,
+                "delivered": False,
+            }
+            self.append_chat_entry(pending_entry)
+
+            send_index = self.drop_send_index
+            dd_key = self.derive_deaddrop_key("send", send_index)
+
+            status, ok_drops = await self.deaddrop.put(dd_key, blob)
+
+            if status in ("OK", "EXISTS"):
+                if ok_drops:
+                    self.prefer_deaddrop_server(ok_drops[0])
+
+                self.drop_send_index += 1
+                self.save_offline_state()
+                self.set_dd_status("put_ok")
+                self.mark_chat_entry_delivered(pending_entry)
+            else:
+                self.set_dd_status("put_fail")
+                self.post("error", "[OFFLINE send failed] deaddrop PUT did not succeed")
+        except Exception as e:
+            self.set_dd_status("put_fail")
+            self.post("error", f"[OFFLINE send failed] {e}")
 
 
     def show_logs(self):
@@ -1859,10 +1922,12 @@ class TermchatI2P(App):
             self.post("system", "Secure session established 🔐")
 
             if self.offline_ready():
-                asyncio.create_task(self.send_offline_secret_if_needed())
+                task = asyncio.create_task(self.sync_offline_secret_if_needed())
+                self.sam_runtime.track_send_task(task)
 
             if self.is_persistent_mode():
-                asyncio.create_task(self.send_deaddrop_server_list())
+                task = asyncio.create_task(self.send_deaddrop_server_list())
+                self.sam_runtime.track_send_task(task)
         
         
 
@@ -2481,27 +2546,68 @@ class TermchatI2P(App):
         if not self.conn:
             return
 
+        if not self.live_ready:
+            return
+
         if not self.offline_ready():
             return
 
-        if self.has_real_offline_secret():
-            return
-        
         if not self.should_initiate_offline_secret():
             return
 
         try:
             _, writer = self.conn
 
-            self.offline_shared_secret = self.generate_offline_shared_secret()
-            self.save_offline_state()
+            if self.has_real_offline_secret():
+                secret = self.offline_shared_secret
+                self.post("system", "Offline secret sync sent.")
+            else:
+                self.offline_shared_secret = self.generate_offline_shared_secret()
+                self.save_offline_state()
+                secret = self.offline_shared_secret
+                self.post("system", "Offline secret generated and saved.")
 
-            writer.write(self.frame_message('X', self.offline_shared_secret))
+            writer.write(self.frame_message('X', secret))
             await writer.drain()
 
             self.post("system", "Offline secret sent to locked peer.")
         except Exception as e:
             self.post("error", f"Failed to send offline secret: {e}")
+
+
+    async def request_offline_secret_if_needed(self):
+        if not self.conn:
+            return
+
+        if not self.live_ready:
+            return
+
+        if not self.offline_ready():
+            return
+
+        if self.has_real_offline_secret():
+            return
+
+        if self.should_initiate_offline_secret():
+            return
+
+        try:
+            _, writer = self.conn
+            writer.write(self.frame_message('S', OFFLINE_SECRET_REQUEST_SIGNAL))
+            await writer.drain()
+            self.post("system", "Requesting offline secret sync from peer.")
+        except Exception as e:
+            self.post("error", f"Failed to request offline secret: {e}")
+
+
+    async def sync_offline_secret_if_needed(self):
+        if not self.conn or not self.live_ready or not self.offline_ready():
+            return
+
+        if self.should_initiate_offline_secret():
+            await self.send_offline_secret_if_needed()
+        else:
+            await self.request_offline_secret_if_needed()
 
 
 
@@ -3033,12 +3139,12 @@ class TermchatI2P(App):
                     fp = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
                     self.post("system", f"TOFU peer pin loaded: {fp}")
 
-            await self.sam.connect()
+            await self.sam_runtime.connect()
 
             # Generate new destination if needed
             if my_dest_b64 is None:
                 self.post("system", "Generating new Ed25519 identity...")
-                my_pub_dest_b64, my_dest_b64 = await self.sam.generate_destination(sig_type=7)
+                my_pub_dest_b64, my_dest_b64 = await self.sam_runtime.generate_destination(sig_type=7)
 
                 if is_persistent:
                     
@@ -3059,7 +3165,7 @@ class TermchatI2P(App):
             self.rank_deaddrop_servers()
             
 
-            await self.sam.create_session(
+            await self.sam_runtime.create_session(
                 self.session_id,
                 destination=my_dest_b64,
                 options={
@@ -3070,7 +3176,7 @@ class TermchatI2P(App):
                 }
             )
 
-            self.my_pub_dest_b64 = await self.sam.naming_lookup("ME")
+            self.my_pub_dest_b64 = await self.sam_runtime.naming_lookup("ME")
             self.my_b32 = self.sam.destination_to_b32(self.my_pub_dest_b64)
             
 
@@ -3445,6 +3551,61 @@ class TermchatI2P(App):
                 self.post("error", "Peer address not yet verified.")
          
          
+        elif msg.strip() == "/unlock":
+            if not self.is_persistent_mode():
+                self.post("error", "Cannot unlock in [bold green]TRANSIENT[/] mode.")
+                return
+
+            if self.offline_mode:
+                self.post("error", "Exit offline mode with /online before unlocking.")
+                return
+
+            if not self.stored_peer:
+                self.post("error", "Profile is not locked to a peer.")
+                return
+
+            old_peer = self.stored_peer
+            key_file = os.path.join(PROFILE_DIR, f"{self.profile}.dat")
+
+            try:
+                with open(key_file, "r", encoding="utf-8") as f:
+                    lines = [line.rstrip("\n") for line in f.readlines()]
+
+                if not lines:
+                    raise RuntimeError("Identity file is empty")
+
+                secure_write_text_atomic(key_file, lines[0] + "\n")
+
+                safe_peer = old_peer.replace("/", "_")
+                offline_path = os.path.join(PROFILE_DIR, f"offline_{safe_peer}.state")
+                try:
+                    if os.path.exists(offline_path):
+                        os.remove(offline_path)
+                except Exception as e:
+                    self.post("status", f"Offline state cleanup failed: {e}")
+
+                if self.offline_mode:
+                    self.leave_offline_mode()
+
+                self.stored_peer = None
+                self.stored_peer_dest_b64 = None
+                self.offline_shared_secret = b"CHANGE_ME_SHARED_OFFLINE_SECRET"
+                self.drop_send_index = 0
+                self.drop_recv_base = 0
+                self.drop_window = 8
+                self.consumed_drop_recv = set()
+                self.seen_drop_msgs = set()
+                self.dd_status = "idle"
+                self.dd_status_ts = 0.0
+                self.clear_tofu_runtime_status()
+                self.watch_peer_b32(self.peer_b32)
+                self.update_command_bar()
+
+                self.post("success", f"Profile {self.profile} unlocked from stored peer.")
+            except Exception as e:
+                self.post("error", f"Failed to unlock profile: {e}")
+
+
         elif msg.startswith("/sendfile"):
             if not self.conn:
                 self.post("error", "No active connection. Use /connect <address>.")
@@ -3638,11 +3799,16 @@ class TermchatI2P(App):
             
 
     async def connect_to_peer(self, target_address):
+        current_task = asyncio.current_task()
+        if current_task:
+            self.sam_runtime.track_connect_task(current_task)
         try:
+            if self.sam_runtime.is_closing():
+                return
             
             self.current_peer_addr = target_address
             
-            reader, writer = await self.sam.stream_connect(target_address)
+            reader, writer = await self.sam_runtime.stream_connect(target_address)
             
             
             if hasattr(self, 'my_dest_b64'):
@@ -3676,6 +3842,9 @@ class TermchatI2P(App):
             self.run_worker(self.receive_loop(self.conn)) 
             
         
+        except SamRuntimeClosed:
+            self.conn = None
+            self.live_ready = False
         except Exception as e:
             self.post("error", f"Connection failed: {e}")
             self.conn = None
@@ -3688,7 +3857,13 @@ class TermchatI2P(App):
 
 
     async def accept_loop(self):
+        current_task = asyncio.current_task()
+        if current_task:
+            self.sam_runtime.track_accept_task(current_task)
         while True:
+            if self.sam_runtime.is_closing():
+                return
+
             
             if self.conn or self.pending_incoming_conn:
                 await asyncio.sleep(1)
@@ -3696,7 +3871,7 @@ class TermchatI2P(App):
             
             try:
                 
-                reader, writer = await self.sam.stream_accept()
+                reader, writer = await self.sam_runtime.stream_accept()
                 
                 try:
                     peer_identity_line = await asyncio.wait_for(reader.readline(), timeout=10.0)
@@ -3766,6 +3941,10 @@ class TermchatI2P(App):
                 caller = self.pending_incoming_addr or "Unknown"
                 self.post("system", f"Incoming call from {caller[:12]}... Type /accept or /decline.")
             
+            except SamRuntimeClosed:
+                break
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 await asyncio.sleep(1)
 
@@ -4035,6 +4214,12 @@ class TermchatI2P(App):
                 if body.startswith(HEARTBEAT_PONG_PREFIX):
                     return
 
+                if body == OFFLINE_SECRET_REQUEST_SIGNAL:
+                    self.post("system", "Peer requested offline secret sync.")
+                    task = asyncio.create_task(self.send_offline_secret_if_needed())
+                    self.sam_runtime.track_send_task(task)
+                    return
+
                 if "QUIT" in body:
                     if source == "pending":
                         caller = self.pending_incoming_addr or "Unknown"
@@ -4132,10 +4317,12 @@ class TermchatI2P(App):
                 self.post("system", "Secure session established 🔐")
                 
                 if self.offline_ready():
-                    asyncio.create_task(self.send_offline_secret_if_needed())
+                    task = asyncio.create_task(self.sync_offline_secret_if_needed())
+                    self.sam_runtime.track_send_task(task)
                     
                 if self.is_persistent_mode():
-                    asyncio.create_task(self.send_deaddrop_server_list())
+                    task = asyncio.create_task(self.send_deaddrop_server_list())
+                    self.sam_runtime.track_send_task(task)
                 
             except Exception as e:
                 self.post("error", f"E2E key error: {e}")
@@ -4553,12 +4740,13 @@ class TermchatI2P(App):
                 self.group_runtime_lock = GroupRuntimeLock(self.group_store, old_key)
                 self.group_runtime_lock.acquire()
 
-            self.group_sam = SAMClient(self.sam_address[0], self.sam_address[1])
-            await self.group_sam.connect()
+            self.group_sam_runtime = SamSessionManager(self.sam_address[0], self.sam_address[1])
+            self.group_sam = self.group_sam_runtime.client
+            await self.group_sam_runtime.connect()
 
             if not meta.get("my_dest_b64"):
                 self.post("system", "Generating group identity...")
-                group_pub_dest_b64, group_dest_b64 = await self.group_sam.generate_destination(sig_type=7)
+                group_pub_dest_b64, group_dest_b64 = await self.group_sam_runtime.generate_destination(sig_type=7)
                 meta["my_dest_b64"] = group_dest_b64
                 self.group_pub_dest_b64 = group_pub_dest_b64
 
@@ -4567,7 +4755,7 @@ class TermchatI2P(App):
                 self.group_session_id = f"chat_group_{session_b32[:6]}_{session_b32[-14:-8]}_{int(time.time())}"
             else:
                 self.group_session_id = f"chat_group_init_{int(time.time())}"
-            await self.group_sam.create_session(
+            await self.group_sam_runtime.create_session(
                 self.group_session_id,
                 destination=meta["my_dest_b64"],
                 options={
@@ -4578,7 +4766,7 @@ class TermchatI2P(App):
                 }
             )
 
-            self.group_pub_dest_b64 = await self.group_sam.naming_lookup("ME")
+            self.group_pub_dest_b64 = await self.group_sam_runtime.naming_lookup("ME")
             my_b32 = self.group_sam.destination_to_b32(self.group_pub_dest_b64)
             meta["my_b32"] = my_b32
 
@@ -4607,7 +4795,9 @@ class TermchatI2P(App):
             self.peer_b32 = f"Group: {meta.get('name', 'group')}"
             self.watch_peer_b32(self.peer_b32)
 
-            self.group_accept_task = asyncio.create_task(self.group_accept_loop(key))
+            self.group_accept_task = self.group_sam_runtime.track_accept_task(
+                asyncio.create_task(self.group_accept_loop(key))
+            )
             self.group_ready_task = asyncio.create_task(self.group_ready_loop(key, my_b32))
             self.update_command_bar()
         except Exception as e:
@@ -4618,6 +4808,10 @@ class TermchatI2P(App):
 
 
     async def close_group(self, quiet: bool = False):
+        runtime = self.group_sam_runtime
+        if runtime:
+            runtime.begin_closing()
+
         if self.group_accept_task:
             self.group_accept_task.cancel()
             try:
@@ -4642,6 +4836,7 @@ class TermchatI2P(App):
                 pass
             self.group_ready_task = None
 
+        known_writers = set()
         for peer in list(self.group_peers.values()):
             connect_task = peer.get("connect_task")
             if connect_task:
@@ -4658,6 +4853,7 @@ class TermchatI2P(App):
                 heartbeat_task.cancel()
             writer = peer.get("writer")
             if writer is not None:
+                known_writers.add(writer)
                 try:
                     writer.write(self.frame_message("S", "__SIGNAL__:QUIT"))
                     await writer.drain()
@@ -4670,7 +4866,11 @@ class TermchatI2P(App):
                 except:
                     pass
 
-        if self.group_sam:
+        if runtime:
+            await runtime.wait_for_tasks()
+            await runtime.close_registered_streams(exclude_writers=known_writers)
+            await runtime.close_client_after_grace()
+        elif self.group_sam:
             try:
                 await self.group_sam.close()
             except:
@@ -4686,6 +4886,7 @@ class TermchatI2P(App):
         closed_name = self.active_group.get("name", "group") if self.active_group else "group"
         self.active_group_key = None
         self.active_group = None
+        self.group_sam_runtime = None
         self.group_sam = None
         self.group_session_id = None
         self.group_pub_dest_b64 = None
@@ -4938,6 +5139,8 @@ class TermchatI2P(App):
     async def connect_group_members(self):
         if not self.active_group or not self.group_publish_ready:
             return
+        if not self.group_sam_runtime or self.group_sam_runtime.is_closing():
+            return
 
         await self.reconcile_group_peers()
         my_b32 = (self.active_group.get("my_b32") or "").lower()
@@ -4956,11 +5159,14 @@ class TermchatI2P(App):
                 continue
             peer["connecting"] = True
             peer["last_connect_attempt_ts"] = now
-            peer["connect_task"] = asyncio.create_task(self.connect_group_peer(normalized["b32"]))
+            task = asyncio.create_task(self.connect_group_peer(normalized["b32"]))
+            peer["connect_task"] = self.group_sam_runtime.track_connect_task(task)
 
 
     async def connect_group_peer(self, b32: str):
-        if not self.active_group or not self.group_sam:
+        if not self.active_group or not self.group_sam_runtime:
+            return
+        if self.group_sam_runtime.is_closing():
             return
         peer_b32 = b32.lower()
         peer = self.group_peers.get(peer_b32)
@@ -4973,7 +5179,7 @@ class TermchatI2P(App):
             return
 
         try:
-            reader, writer = await self.group_sam.stream_connect(b32)
+            reader, writer = await self.group_sam_runtime.stream_connect(b32)
             peer = self.group_peers.get(peer_b32)
             if not self.active_group or not peer:
                 await self.close_group_writer(writer)
@@ -5011,6 +5217,8 @@ class TermchatI2P(App):
         except asyncio.CancelledError:
             peer["connecting"] = False
             raise
+        except SamRuntimeClosed:
+            peer["connecting"] = False
         except Exception as e:
             self.post("status", f"Group connect failed for {peer['member']['name']}: {e}")
             peer["reader"] = None
@@ -5032,10 +5240,12 @@ class TermchatI2P(App):
 
     async def group_ready_loop(self, group_key: str, my_b32: str):
         try:
-            while self.active_group_key == group_key and self.group_sam:
+            while self.active_group_key == group_key and self.group_sam_runtime:
                 try:
-                    await asyncio.wait_for(self.group_sam.naming_lookup(my_b32), timeout=5.0)
-                    if self.active_group_key != group_key or not self.group_sam:
+                    if self.group_sam_runtime.is_closing():
+                        return
+                    await asyncio.wait_for(self.group_sam_runtime.naming_lookup(my_b32), timeout=5.0)
+                    if self.active_group_key != group_key or not self.group_sam_runtime:
                         return
                     self.group_publish_ready = True
                     self.network_status = "visible"
@@ -5062,9 +5272,11 @@ class TermchatI2P(App):
 
 
     async def group_accept_loop(self, group_key: str):
-        while self.active_group_key == group_key and self.group_sam:
+        while self.active_group_key == group_key and self.group_sam_runtime:
             try:
-                reader, writer = await self.group_sam.stream_accept()
+                if self.group_sam_runtime.is_closing():
+                    return
+                reader, writer = await self.group_sam_runtime.stream_accept()
                 try:
                     identity_line = await asyncio.wait_for(reader.readline(), timeout=10.0)
                 except asyncio.TimeoutError:
@@ -5119,6 +5331,8 @@ class TermchatI2P(App):
                     await self.close_group_writer(old_writer)
                 self.post("system", f"Group incoming connection: {member['name']}")
             except asyncio.CancelledError:
+                break
+            except SamRuntimeClosed:
                 break
             except Exception:
                 await asyncio.sleep(1)
@@ -5508,6 +5722,13 @@ class TermchatI2P(App):
 
 
     async def send_group_message(self, message: str):
+        if self.group_sam_runtime and self.group_sam_runtime.is_closing():
+            self.post("error", "Cannot send while group is closing.")
+            return
+        current_task = asyncio.current_task()
+        if self.group_sam_runtime and current_task:
+            self.group_sam_runtime.track_send_task(current_task)
+
         if not self.active_group:
             self.post("error", "No group is open.")
             return
@@ -5555,6 +5776,13 @@ class TermchatI2P(App):
 
 
     async def send_group_image(self, path, mode="braille"):
+        if self.group_sam_runtime and self.group_sam_runtime.is_closing():
+            self.post("error", "Cannot send image while group is closing.")
+            return
+        current_task = asyncio.current_task()
+        if self.group_sam_runtime and current_task:
+            self.group_sam_runtime.track_send_task(current_task)
+
         if not self.active_group:
             self.post("error", "No group is open.")
             return
@@ -5695,6 +5923,13 @@ class TermchatI2P(App):
 
 
     async def send_file(self, path):
+        if self.sam_runtime and self.sam_runtime.is_closing():
+            self.post("error", "Cannot send file while chat is closing.")
+            return
+        current_task = asyncio.current_task()
+        if self.sam_runtime and current_task:
+            self.sam_runtime.track_send_task(current_task)
+
         try:
             reader, writer = self.conn
 
@@ -5759,6 +5994,12 @@ class TermchatI2P(App):
 
 
     async def send_image(self, path, mode="braille"):
+        if self.sam_runtime and self.sam_runtime.is_closing():
+            self.post("error", "Cannot send image while chat is closing.")
+            return
+        current_task = asyncio.current_task()
+        if self.sam_runtime and current_task:
+            self.sam_runtime.track_send_task(current_task)
 
         if not self.conn:
             self.post("error", "No active connection")
@@ -5898,7 +6139,13 @@ class TermchatI2P(App):
             self.save_offline_state()
         except:
             pass
+
+        runtime = self.sam_runtime
+        if runtime:
+            runtime.begin_closing()
         
+        known_writers = set()
+
         if self.pending_incoming_task:
             try:
                 self.pending_incoming_task.cancel()
@@ -5910,6 +6157,13 @@ class TermchatI2P(App):
         if self.pending_incoming_conn:
             try:
                 _, writer = self.pending_incoming_conn
+                known_writers.add(writer)
+                try:
+                    writer.write(self.frame_message('S', "__SIGNAL__:QUIT"))
+                    await writer.drain()
+                    await asyncio.sleep(0.12)
+                except:
+                    pass
                 writer.close()
                 await writer.wait_closed()
             except:
@@ -5923,6 +6177,8 @@ class TermchatI2P(App):
                 
                 await self.send_control("QUIT")
                 _, writer = self.conn
+                known_writers.add(writer)
+                await asyncio.sleep(0.12)
                 writer.close()
                 
                 await writer.wait_closed()
@@ -5930,10 +6186,15 @@ class TermchatI2P(App):
             except:
                 pass
             
-        try:
-            await self.sam.close()
-        except:
-            pass
+        if runtime:
+            await runtime.wait_for_tasks()
+            await runtime.close_registered_streams(exclude_writers=known_writers)
+            await runtime.close_client_after_grace()
+        else:
+            try:
+                await self.sam.close()
+            except:
+                pass
         
         
         # Deaddrop SAM cleanup

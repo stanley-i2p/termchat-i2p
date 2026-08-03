@@ -3,6 +3,7 @@ import base64
 import hashlib
 
 DEBUG = False
+CANCELLED_STREAM_CONNECT_RESPONSE_GRACE = 4.0
 
 
 class SAMClient:
@@ -144,9 +145,10 @@ class SAMClient:
     
     # STREAM CONNECT
     
-    async def stream_connect(self, destination_b32):
+    async def stream_connect(self, destination_b32, cancel_event=None):
         writer = None
         returned = False
+        connect_sent = False
         reader, writer = await asyncio.open_connection(
             self.sam_host, self.sam_port
         )
@@ -165,8 +167,35 @@ class SAMClient:
 
             writer.write(cmd.encode())
             await writer.drain()
+            connect_sent = True
 
-            resp = await reader.readline()
+            try:
+                if cancel_event is None:
+                    resp = await reader.readline()
+                else:
+                    while True:
+                        if cancel_event.is_set():
+                            raise asyncio.CancelledError()
+                        try:
+                            resp = await asyncio.wait_for(reader.readline(), timeout=0.1)
+                            break
+                        except asyncio.TimeoutError:
+                            continue
+            except asyncio.CancelledError:
+                if connect_sent:
+                    try:
+                        resp = await asyncio.wait_for(
+                            reader.readline(),
+                            timeout=CANCELLED_STREAM_CONNECT_RESPONSE_GRACE,
+                        )
+                        if b"RESULT=OK" in resp:
+                            returned = True
+                            writer.close()
+                            await writer.wait_closed()
+                            returned = False
+                    except:
+                        pass
+                raise
             resp_str = resp.decode().strip()
 
             if DEBUG:
@@ -186,7 +215,7 @@ class SAMClient:
     
     # STREAM ACCEPT (server)
     
-    async def stream_accept(self):
+    async def stream_accept(self, cancel_event=None):
         writer = None
         returned = False
         reader, writer = await asyncio.open_connection(
@@ -203,7 +232,17 @@ class SAMClient:
             writer.write(cmd.encode())
             await writer.drain()
 
-            resp = await reader.readline()
+            if cancel_event is None:
+                resp = await reader.readline()
+            else:
+                while True:
+                    if cancel_event.is_set():
+                        raise asyncio.CancelledError()
+                    try:
+                        resp = await asyncio.wait_for(reader.readline(), timeout=0.1)
+                        break
+                    except asyncio.TimeoutError:
+                        continue
 
             if b"RESULT=OK" not in resp:
                 raise RuntimeError(f"ACCEPT failed: {resp.decode()}")

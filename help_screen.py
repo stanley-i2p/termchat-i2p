@@ -38,6 +38,7 @@ HELP_LINES = [
     ("help_bold", "Identity:"),
     ("help", ""),
     ("help", "  /lock                    Lock persistent profile to current peer (not available in TRANSIENT mode)"),
+    ("help", "  /unlock                  Unlock persistent profile from stored peer (not available in TRANSIENT mode)"),
     ("help", ""),
     ("help_bold", "Files:"),
     ("help", ""),
