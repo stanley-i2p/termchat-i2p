@@ -106,6 +106,7 @@ HEARTBEAT_PING_PREFIX = "__SIGNAL__:PING:"
 HEARTBEAT_PONG_PREFIX = "__SIGNAL__:PONG:"
 OFFLINE_SECRET_REQUEST_SIGNAL = "__SIGNAL__:OFFLINE_SECRET_REQUEST"
 GROUP_RECONNECT_INTERVAL = 5.0
+GROUP_HANDSHAKE_TIMEOUT = 45.0
 
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".termchat-i2p")
 BASE_DIR = os.path.abspath(BASE_DIR)
@@ -4851,6 +4852,9 @@ class TermchatI2P(App):
             heartbeat_task = peer.get("heartbeat_task")
             if heartbeat_task:
                 heartbeat_task.cancel()
+            handshake_timeout_task = peer.get("handshake_timeout_task")
+            if handshake_timeout_task:
+                handshake_timeout_task.cancel()
             writer = peer.get("writer")
             if writer is not None:
                 known_writers.add(writer)
@@ -5035,10 +5039,14 @@ class TermchatI2P(App):
             "connect_task": None,
             "task": None,
             "heartbeat_task": None,
+            "handshake_timeout_task": None,
             "heartbeat_last_rx_ts": 0.0,
             "heartbeat_last_ping_ts": 0.0,
             "connecting": False,
             "last_connect_attempt_ts": 0.0,
+            "last_connect_skip_log_ts": 0.0,
+            "handshake_identity_received": False,
+            "handshake_key_received": False,
             "incoming_image_name": None,
             "incoming_image_mime": None,
             "incoming_image_expected": 0,
@@ -5085,6 +5093,50 @@ class TermchatI2P(App):
         if heartbeat_task:
             heartbeat_task.cancel()
             peer["heartbeat_task"] = None
+        self.cancel_group_handshake_timeout(peer)
+
+
+    def cancel_group_handshake_timeout(self, peer: dict):
+        task = peer.get("handshake_timeout_task")
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        peer["handshake_timeout_task"] = None
+
+
+    def start_group_handshake_timeout(self, peer_b32: str, writer):
+        peer = self.group_peers.get(peer_b32)
+        if not peer or peer.get("writer") is not writer:
+            return
+        self.cancel_group_handshake_timeout(peer)
+        peer["handshake_timeout_task"] = asyncio.create_task(
+            self.group_handshake_timeout_loop(peer_b32, writer)
+        )
+
+
+    async def group_handshake_timeout_loop(self, peer_b32: str, writer):
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(GROUP_HANDSHAKE_TIMEOUT)
+            peer = self.group_peers.get(peer_b32)
+            if not self.active_group or not peer:
+                return
+            if peer.get("writer") is not writer or peer.get("ready"):
+                return
+
+            peer["handshake_timeout_task"] = None
+            self.post(
+                "status",
+                f"Group handshake timed out for {peer['member']['name']} ({peer_b32}); "
+                f"identity_received={bool(peer.get('handshake_identity_received'))}, "
+                f"key_received={bool(peer.get('handshake_key_received'))}. Closing stalled stream."
+            )
+            await self.close_group_writer(writer)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            peer = self.group_peers.get(peer_b32)
+            if peer and peer.get("handshake_timeout_task") is current_task:
+                peer["handshake_timeout_task"] = None
 
 
     async def reconcile_group_peers(self):
@@ -5131,6 +5183,9 @@ class TermchatI2P(App):
             heartbeat_task = peer.get("heartbeat_task")
             if heartbeat_task:
                 heartbeat_task.cancel()
+            handshake_timeout_task = peer.get("handshake_timeout_task")
+            if handshake_timeout_task:
+                handshake_timeout_task.cancel()
 
         for member in members_by_b32.values():
             self.ensure_group_peer(member, authorized=True)
@@ -5150,7 +5205,20 @@ class TermchatI2P(App):
             if normalized["b32"].lower() == my_b32:
                 continue
             peer = self.ensure_group_peer(normalized, authorized=True)
-            if peer.get("ready") or peer.get("connecting") or peer.get("writer"):
+            if peer.get("ready"):
+                continue
+            if peer.get("connecting") or peer.get("writer"):
+                if (
+                    peer.get("writer")
+                    and not peer.get("ready")
+                    and now - peer.get("last_connect_skip_log_ts", 0.0) >= 10.0
+                ):
+                    peer["last_connect_skip_log_ts"] = now
+                    self.post(
+                        "status",
+                        f"Group reconnect deferred for {peer['member']['name']}: "
+                        f"connecting={bool(peer.get('connecting'))}, writer=True, ready=False."
+                    )
                 continue
             if (
                 peer.get("last_connect_attempt_ts")
@@ -5179,7 +5247,9 @@ class TermchatI2P(App):
             return
 
         try:
+            self.post("system", f"Group outbound connect started: {peer['member']['name']} ({peer_b32}).")
             reader, writer = await self.group_sam_runtime.stream_connect(b32)
+            self.post("system", f"Group outbound SAM stream connected: {peer['member']['name']} ({peer_b32}).")
             peer = self.group_peers.get(peer_b32)
             if not self.active_group or not peer:
                 await self.close_group_writer(writer)
@@ -5187,6 +5257,14 @@ class TermchatI2P(App):
 
             prefer_outbound = self.group_local_prefers_outbound(peer_b32)
             existing_writer = peer.get("writer")
+            if existing_writer is not None:
+                direction = "outbound" if prefer_outbound else "inbound"
+                self.post(
+                    "system",
+                    f"Group collision decision for {peer['member']['name']}: "
+                    f"local={self.active_group.get('my_b32', '').lower()}, peer={peer_b32}, "
+                    f"preferred={direction}."
+                )
             if peer.get("ready") and existing_writer is not None:
                 peer["connecting"] = False
                 await self.close_group_writer(writer)
@@ -5209,7 +5287,10 @@ class TermchatI2P(App):
             peer["e2e"] = E2E(pq_enabled=False)
             peer["heartbeat_last_rx_ts"] = 0.0
             peer["heartbeat_last_ping_ts"] = 0.0
+            peer["handshake_identity_received"] = False
+            peer["handshake_key_received"] = False
             await self.send_group_handshake(writer, peer["e2e"])
+            self.start_group_handshake_timeout(peer_b32, writer)
             peer["task"] = asyncio.create_task(self.group_receive_loop(peer_b32, reader, writer))
             if old_writer is not None:
                 await self.close_group_writer(old_writer)
@@ -5240,6 +5321,7 @@ class TermchatI2P(App):
 
     async def group_ready_loop(self, group_key: str, my_b32: str):
         try:
+            self.post("system", f"Waiting for group destination visibility: {my_b32}.")
             while self.active_group_key == group_key and self.group_sam_runtime:
                 try:
                     if self.group_sam_runtime.is_closing():
@@ -5255,8 +5337,10 @@ class TermchatI2P(App):
                     await self.connect_group_members()
                     return
                 except asyncio.TimeoutError:
+                    self.post("status", f"Group destination visibility lookup timed out: {my_b32}.")
                     await asyncio.sleep(2.0)
-                except Exception:
+                except Exception as e:
+                    self.post("status", f"Group destination visibility lookup failed: {type(e).__name__}: {e}")
                     await asyncio.sleep(2.0)
         except asyncio.CancelledError:
             pass
@@ -5277,12 +5361,15 @@ class TermchatI2P(App):
                 if self.group_sam_runtime.is_closing():
                     return
                 reader, writer = await self.group_sam_runtime.stream_accept()
+                self.post("system", "Group SAM accept ready; waiting for an incoming caller identity.")
                 try:
                     identity_line = await asyncio.wait_for(reader.readline(), timeout=10.0)
                 except asyncio.TimeoutError:
+                    self.post("status", "Group incoming accept timed out waiting for caller identity.")
                     writer.close()
                     continue
                 if not identity_line:
+                    self.post("status", "Group incoming accept closed before caller identity arrived.")
                     writer.close()
                     continue
 
@@ -5290,9 +5377,15 @@ class TermchatI2P(App):
                 peer_b32 = self.group_sam.destination_to_b32(raw_dest).lower()
                 member = self.group_member_by_b32(peer_b32)
                 authorized = member is not None
+                self.post(
+                    "system",
+                    f"Group incoming caller identified: "
+                    f"{member['name'] if member else 'unknown member'} ({peer_b32})."
+                )
 
                 if not authorized:
                     if not group_is_admin(self.active_group):
+                        self.post("status", f"Rejected unauthorized group caller: {peer_b32}.")
                         writer.close()
                         await writer.wait_closed()
                         continue
@@ -5302,6 +5395,14 @@ class TermchatI2P(App):
                 prefer_outbound = self.group_local_prefers_outbound(peer_b32)
                 existing_writer = peer.get("writer")
                 has_collision = existing_writer is not None or peer.get("connecting")
+                if has_collision:
+                    direction = "outbound" if prefer_outbound else "inbound"
+                    self.post(
+                        "system",
+                        f"Group collision decision for {peer['member']['name']}: "
+                        f"local={self.active_group.get('my_b32', '').lower()}, peer={peer_b32}, "
+                        f"preferred={direction}."
+                    )
                 if peer.get("ready") and existing_writer is not None:
                     await self.close_group_writer(writer)
                     self.post("system", f"Group connection collision: kept ready session with {peer['member']['name']}.")
@@ -5325,7 +5426,10 @@ class TermchatI2P(App):
                 peer["connecting"] = False
                 peer["heartbeat_last_rx_ts"] = 0.0
                 peer["heartbeat_last_ping_ts"] = 0.0
+                peer["handshake_identity_received"] = False
+                peer["handshake_key_received"] = False
                 await self.send_group_handshake(writer, peer["e2e"])
+                self.start_group_handshake_timeout(peer_b32, writer)
                 peer["task"] = asyncio.create_task(self.group_receive_loop(peer_b32, reader, writer))
                 if old_writer is not None:
                     await self.close_group_writer(old_writer)
@@ -5334,31 +5438,48 @@ class TermchatI2P(App):
                 break
             except SamRuntimeClosed:
                 break
-            except Exception:
+            except Exception as e:
+                self.post("status", f"Group accept failed: {type(e).__name__}: {e}")
                 await asyncio.sleep(1)
 
 
     async def group_receive_loop(self, peer_b32: str, reader, writer):
+        close_reason = "stream ended"
         try:
             while self.active_group and self.group_peers.get(peer_b32, {}).get("writer") == writer:
                 try:
                     msg_type, msg_id, payload = await self.read_frame(reader)
-                except UnicodeDecodeError:
+                except UnicodeDecodeError as e:
+                    self.post("status", f"Invalid group frame encoding from {peer_b32}: {e}")
                     continue
-                except ValueError:
+                except ValueError as e:
+                    self.post("status", f"Invalid group frame from {peer_b32}: {e}")
                     continue
                 await self.handle_group_frame(peer_b32, msg_type, msg_id, payload, writer)
         except asyncio.CancelledError:
+            close_reason = "receive task cancelled"
             pass
-        except (asyncio.IncompleteReadError, ConnectionResetError):
-            pass
+        except asyncio.IncompleteReadError as e:
+            close_reason = f"unexpected EOF ({len(e.partial)}/{e.expected} bytes)"
+        except ConnectionResetError as e:
+            close_reason = f"connection reset ({e})"
         except Exception as e:
+            close_reason = f"{type(e).__name__}: {e}"
             peer = self.group_peers.get(peer_b32)
             if peer:
                 self.post("status", f"Group protocol error from {peer['member']['name']}: {e}")
         finally:
             peer = self.group_peers.get(peer_b32)
             if peer and peer.get("writer") == writer:
+                self.cancel_group_handshake_timeout(peer)
+                if not peer.get("ready"):
+                    self.post(
+                        "status",
+                        f"Group connection closed before secure handshake completed for "
+                        f"{peer['member']['name']} ({peer_b32}): {close_reason}; "
+                        f"identity_received={bool(peer.get('handshake_identity_received'))}, "
+                        f"key_received={bool(peer.get('handshake_key_received'))}."
+                    )
                 peer["reader"] = None
                 peer["writer"] = None
                 peer["ready"] = False
@@ -5367,6 +5488,7 @@ class TermchatI2P(App):
                 if task:
                     task.cancel()
                     peer["heartbeat_task"] = None
+                self.watch_peer_b32(self.peer_b32)
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -5399,6 +5521,9 @@ class TermchatI2P(App):
                 if announced_b32 != peer_b32.lower():
                     self.post("error", f"Group identity mismatch for {peer['member']['name']}: {announced_b32}")
                     writer.close()
+                else:
+                    peer["handshake_identity_received"] = True
+                    self.post("system", f"Group identity verified: {peer['member']['name']}.")
             except Exception as e:
                 self.post("status", f"Invalid group identity from {peer['member']['name']}: {e}")
             return
@@ -5406,8 +5531,10 @@ class TermchatI2P(App):
         if msg_type == "K":
             try:
                 peer["e2e"].receive_peer_key(payload)
+                peer["handshake_key_received"] = True
                 if peer["e2e"].ready():
                     peer["ready"] = True
+                    self.cancel_group_handshake_timeout(peer)
                     peer["heartbeat_last_rx_ts"] = time.monotonic()
                     peer["heartbeat_last_ping_ts"] = time.monotonic()
                     self.start_group_heartbeat(peer_b32)
@@ -5584,6 +5711,7 @@ class TermchatI2P(App):
                 self.active_group_key = self.group_store.save(self.active_group)
                 self.post("success", f"Redeemed group invite for {peer['member']['name']}.")
                 await self.send_group_roster_sync_to_ready_peers()
+                self.watch_peer_b32(self.peer_b32)
             except Exception as e:
                 self.post("error", f"Rejected group invite proof from {peer['member']['name']}: {e}")
             return
@@ -5614,6 +5742,7 @@ class TermchatI2P(App):
                 self.active_group_key = self.group_store.save(self.active_group)
                 self.post("system", f"Merged group roster from {peer['member']['name']}.")
                 await self.connect_group_members()
+                self.watch_peer_b32(self.peer_b32)
             except Exception as e:
                 self.post("error", f"Group roster sync failed from {peer['member']['name']}: {e}")
             return
@@ -5626,6 +5755,7 @@ class TermchatI2P(App):
                 self.active_group_key = self.group_store.save(self.active_group)
                 self.post("system", f"Merged legacy group roster from {peer['member']['name']}.")
                 await self.connect_group_members()
+                self.watch_peer_b32(self.peer_b32)
             except Exception as e:
                 self.post("error", f"Group invite merge failed from {peer['member']['name']}: {e}")
 
