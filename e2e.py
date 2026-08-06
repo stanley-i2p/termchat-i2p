@@ -5,6 +5,7 @@ from hashlib import sha256
 
 from nacl.public import PrivateKey, PublicKey
 from nacl.bindings import crypto_scalarmult
+from nacl.exceptions import CryptoError
 from nacl.secret import SecretBox
 from nacl.utils import random
 
@@ -62,14 +63,14 @@ class E2E:
                 return
 
             material = b"|".join([
-                b"TERMCHAT_HYBRID_V1",
+                b"COMMTOOLS-I2P-HYBRID-V1",
                 self.classical_shared,
                 self.pq_shared,
             ])
             self.session_key = sha256(material).digest()
         else:
             material = b"|".join([
-                b"TERMCHAT_CLASSICAL_V1",
+                b"COMMTOOLS-I2P-CLASSICAL-V1",
                 self.classical_shared,
             ])
             self.session_key = sha256(material).digest()
@@ -120,6 +121,40 @@ class E2E:
     
     # Encryption
     
+
+    def encrypt_strict(self, payload):
+        if not self.session_key:
+            raise RuntimeError("secure session key is not ready")
+
+        box = SecretBox(self.session_key)
+        nonce = random(SecretBox.NONCE_SIZE)
+
+        try:
+            encrypted = box.encrypt(bytes(payload), nonce)
+        except Exception as exc:
+            raise ValueError("payload encryption failed") from exc
+
+        return nonce + encrypted.ciphertext
+
+
+    def decrypt_strict(self, payload):
+        if not self.session_key:
+            raise RuntimeError("secure session key is not ready")
+
+        payload = bytes(payload)
+        minimum_size = SecretBox.NONCE_SIZE + SecretBox.MACBYTES
+        if len(payload) < minimum_size:
+            raise ValueError("encrypted payload is too short")
+
+        nonce = payload[:SecretBox.NONCE_SIZE]
+        ciphertext = payload[SecretBox.NONCE_SIZE:]
+        box = SecretBox(self.session_key)
+
+        try:
+            return box.decrypt(ciphertext, nonce)
+        except CryptoError as exc:
+            raise ValueError("payload authentication failed") from exc
+
 
     def encrypt(self, payload):
 

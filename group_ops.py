@@ -12,14 +12,14 @@ import fcntl
 from nacl.signing import SigningKey, VerifyKey
 
 
-GROUP_INVITE_STRING_PREFIX = "ICEDCOMM-GROUP-INVITE-v1:"
+GROUP_INVITE_STRING_PREFIX = "COMMTOOLS-I2P-GROUP-INVITE-v1:"
 GROUP_CONTROL_JOIN_PROOF = "join_proof"
 GROUP_CONTROL_RENAME_REQUEST = "rename_request"
 
 
-GROUP_INVITE_FORMAT = "icedcomm-i2p-group-invite"
-GROUP_ROSTER_FORMAT = "icedcomm-i2p-group-roster"
-GROUP_ROSTER_SIGNATURE_FORMAT = "icedcomm-i2p-group-roster-signature"
+GROUP_INVITE_FORMAT = "commtools-i2p-group-invite"
+GROUP_ROSTER_FORMAT = "commtools-i2p-group-roster"
+GROUP_ROSTER_SIGNATURE_FORMAT = "commtools-i2p-group-roster-signature"
 
 
 def is_valid_b32_address(value: str) -> bool:

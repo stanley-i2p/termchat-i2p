@@ -165,7 +165,7 @@ class GroupManagerScreen(ModalScreen[None]):
             with Horizontal(classes="group-action-row"):
                 yield Button("Join Invite", id="group-join-button", variant="primary", compact=True)
                 yield Static("", classes="group-button-gap")
-                yield Input(placeholder="ICEDCOMM-GROUP-INVITE-v1:...", id="group-join-invite", compact=True)
+                yield Input(placeholder="COMMTOOLS-I2P-GROUP-INVITE-v1:...", id="group-join-invite", compact=True)
                 yield Static("", classes="group-button-gap")
                 yield Input(placeholder="your display name", id="group-join-display", compact=True)
             with Horizontal(classes="group-action-row"):

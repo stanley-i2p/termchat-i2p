@@ -2,6 +2,7 @@
 
 **Termchat-I2P** is a terminal-based private messenger designed for one-to-one communication over the I2P network.
 It supports both **live encrypted chat** and **offline messaging**, while keeping the protocol compact and operationally simple.
+It implements the shared **CommTools-I2P Protocol**, alongside IcedComm-I2P and future compatible clients.
 
 The application has two modes: **transient mode** for short-lived live sessions, and **persistent mode** for long-term trusted peers with saved identity and offline support.
 

@@ -42,6 +42,8 @@ from file_picker import FilePickerScreen
 from group_ops import (
     GROUP_CONTROL_JOIN_PROOF,
     GROUP_CONTROL_RENAME_REQUEST,
+    GROUP_INVITE_FORMAT,
+    GROUP_ROSTER_FORMAT,
     GroupRuntimeLock,
     GroupStore,
     apply_group_member_rename,
@@ -77,9 +79,9 @@ from vault import fs_decrypt, fs_encrypt, fs_runtime_enter, fs_runtime_leave, fs
 MAGIC = b"\x89I2P"
 PROTOCOL_VERSION = 3
 
-REPLY_BEGIN_MARKER = "[ICEDCOMM-REPLY-v1]"
-REPLY_QUOTE_MARKER = "[ICEDCOMM-QUOTE]"
-REPLY_END_MARKER = "[/ICEDCOMM-REPLY]"
+REPLY_BEGIN_MARKER = "[COMMTOOLS-I2P-REPLY-v1]"
+REPLY_QUOTE_MARKER = "[COMMTOOLS-I2P-QUOTE]"
+REPLY_END_MARKER = "[/COMMTOOLS-I2P-REPLY]"
 
 # SECURITY LIMITS
 MAX_FRAME_SIZE = 256 * 1024      # 256 KB max protocol frame
@@ -563,14 +565,7 @@ FS_INSTANCE_COUNT = fs_runtime_enter(BASE_DIR)
 
 
 class CommandInput(Input):
-    def _on_paste(self, event: events.Paste) -> None:
-        if event.text:
-            selection = self.selection
-            if selection.is_empty:
-                self.insert_text_at_cursor(event.text)
-            else:
-                self.replace(event.text, *selection)
-        event.stop()
+    pass
 
 
 class MessageComposer(TextArea):
@@ -2059,7 +2054,7 @@ class TermchatI2P(App):
                 try:
                     msg_type, msg_id, payload = await self.read_frame(reader)
 
-                    if msg_type not in ('K', 'P', 'O', 'S', 'D', 'Z'):
+                    if msg_type not in ('K', 'P', 'O', 'S', 'D', 'Z', 'X', 'L'):
                         payload = self.e2e.decrypt(payload)
 
                 except UnicodeDecodeError:
@@ -2547,10 +2542,15 @@ class TermchatI2P(App):
         if not self.conn:
             return
 
-        if not self.live_ready:
+        if not self.live_ready or not self.e2e.ready():
             return
 
-        if not self.offline_ready():
+        if not (
+            self.is_persistent_mode()
+            and self.stored_peer
+            and self.stored_peer_dest_b64
+            and self.deaddrop_servers
+        ):
             return
 
         if not self.should_initiate_offline_secret():
@@ -2568,7 +2568,8 @@ class TermchatI2P(App):
                 secret = self.offline_shared_secret
                 self.post("system", "Offline secret generated and saved.")
 
-            writer.write(self.frame_message('X', secret))
+            payload = self.e2e.encrypt_strict(secret)
+            writer.write(self.frame_message('X', payload))
             await writer.drain()
 
             self.post("system", "Offline secret sent to locked peer.")
@@ -2950,9 +2951,20 @@ class TermchatI2P(App):
         if not self.conn:
             return
 
+        if not (
+            self.live_ready
+            and self.e2e.ready()
+            and self.is_persistent_mode()
+            and self.stored_peer
+            and self.stored_peer_dest_b64
+            and self.deaddrop_servers
+        ):
+            return
+
         try:
             _, writer = self.conn
-            payload = "\n".join(self.deaddrop_servers).encode()
+            plaintext = "\n".join(self.deaddrop_servers).encode()
+            payload = self.e2e.encrypt_strict(plaintext)
             writer.write(self.frame_message('L', payload))
             await writer.drain()
             self.post("system", f"Shared {len(self.deaddrop_servers)} deaddrop servers with peer.")
@@ -3964,7 +3976,7 @@ class TermchatI2P(App):
                         self.mark_heartbeat_rx()
                     
                     # Decrypt payload if encrypted
-                    if msg_type not in ('K','P','O','S','D','Z'):
+                    if msg_type not in ('K','P','O','S','D','Z','X','L'):
                         payload = self.e2e.decrypt(payload)
                     
                 except UnicodeDecodeError:
@@ -4377,11 +4389,26 @@ class TermchatI2P(App):
                 
         elif msg_type == 'X':
             try:
-                if not self.offline_ready():
+                if source != "live" or not (
+                    self.is_persistent_mode()
+                    and self.stored_peer
+                    and self.stored_peer_dest_b64
+                    and self.deaddrop_servers
+                ):
                     self.post("error", "Received offline secret outside persistent locked-peer mode.")
                     return
 
-                if len(payload) != 32:
+                if not self.live_ready or not self.e2e.ready():
+                    self.post("error", "Received offline secret before secure session was ready.")
+                    return
+
+                try:
+                    secret = self.e2e.decrypt_strict(payload)
+                except Exception as e:
+                    self.post("error", f"Offline secret authentication failed: {e}")
+                    return
+
+                if len(secret) != 32:
                     self.post("error", "Invalid offline secret length.")
                     return
 
@@ -4389,7 +4416,7 @@ class TermchatI2P(App):
                     self.post("system", "Offline secret already exists. Ignoring replacement.")
                     return
 
-                self.offline_shared_secret = payload
+                self.offline_shared_secret = secret
                 self.save_offline_state()
                 self.post("system", "Offline secret received and saved.")
             except Exception as e:
@@ -4398,19 +4425,43 @@ class TermchatI2P(App):
              
         elif msg_type == 'L':
             try:
-                stripped = body.strip()
+                if source != "live" or not (
+                    self.is_persistent_mode()
+                    and self.stored_peer
+                    and self.stored_peer_dest_b64
+                ):
+                    self.post("error", "Received deaddrop server list outside persistent locked-peer mode.")
+                    return
+
+                if not self.live_ready or not self.e2e.ready():
+                    self.post("error", "Received deaddrop server list before secure session was ready.")
+                    return
+
+                try:
+                    plaintext = self.e2e.decrypt_strict(payload)
+                except Exception as e:
+                    self.post("error", f"Deaddrop server list authentication failed: {e}")
+                    return
+
+                try:
+                    list_body = plaintext.decode("utf-8")
+                except UnicodeDecodeError:
+                    self.post("error", "Received invalid UTF-8 deaddrop server list.")
+                    return
+
+                stripped = list_body.strip()
                 if stripped.startswith("{"):
                     data = json.loads(stripped)
                     data_format = data.get("format")
                     data_kind = data.get("kind")
-                    if data_format in ("icedcomm-i2p-group-roster", "icedcomm-i2p-group-invite"):
+                    if data_format in (GROUP_ROSTER_FORMAT, GROUP_INVITE_FORMAT):
                         self.post("system", "Received group payload on direct chat; open a group session to process group rosters.")
                         return
                     if data_kind in (GROUP_CONTROL_JOIN_PROOF, GROUP_CONTROL_RENAME_REQUEST):
                         self.post("system", "Received group control payload on direct chat; ignoring outside group session.")
                         return
 
-                servers = [line.strip() for line in body.splitlines() if line.strip()]
+                servers = [line.strip() for line in list_body.splitlines() if line.strip()]
                 if not servers:
                     return
 
@@ -5734,7 +5785,7 @@ class TermchatI2P(App):
             return
 
         data_format = data.get("format")
-        if data_format == "icedcomm-i2p-group-roster":
+        if data_format == GROUP_ROSTER_FORMAT:
             if not peer.get("authorized"):
                 return
             try:
@@ -5747,7 +5798,7 @@ class TermchatI2P(App):
                 self.post("error", f"Group roster sync failed from {peer['member']['name']}: {e}")
             return
 
-        if data_format == "icedcomm-i2p-group-invite":
+        if data_format == GROUP_INVITE_FORMAT:
             if not peer.get("authorized"):
                 return
             try:
