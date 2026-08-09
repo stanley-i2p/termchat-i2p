@@ -210,11 +210,21 @@ class E2E:
 
 
     def decrypt_offline_blob(self, blob: bytes, blob_key: bytes):
-        if len(blob) < 25:
-            raise ValueError("Offline blob too short")
+        return self.decrypt_offline_blob_strict(blob, blob_key)
 
-        nonce = blob[:24]
-        ciphertext = blob[24:]
+
+    def decrypt_offline_blob_strict(self, blob: bytes, blob_key: bytes):
+        if len(blob_key) != SecretBox.KEY_SIZE:
+            raise ValueError("invalid offline blob key length")
+
+        if len(blob) < SecretBox.NONCE_SIZE + SecretBox.MACBYTES:
+            raise ValueError("offline blob is too short")
+
+        nonce = blob[:SecretBox.NONCE_SIZE]
+        ciphertext = blob[SecretBox.NONCE_SIZE:]
 
         box = SecretBox(blob_key)
-        return box.decrypt(ciphertext, nonce)
+        try:
+            return box.decrypt(ciphertext, nonce)
+        except CryptoError as exc:
+            raise ValueError("offline blob authentication failed") from exc

@@ -107,6 +107,14 @@ HEARTBEAT_TIMEOUT = 35.0
 HEARTBEAT_PING_PREFIX = "__SIGNAL__:PING:"
 HEARTBEAT_PONG_PREFIX = "__SIGNAL__:PONG:"
 OFFLINE_SECRET_REQUEST_SIGNAL = "__SIGNAL__:OFFLINE_SECRET_REQUEST"
+OFFLINE_INDEX_SYNC_VERSION = 1
+OFFLINE_INDEX_SYNC_PAYLOAD_LEN = 17
+OFFLINE_GAP_MISS_ROUNDS = 3
+OFFLINE_FORWARD_PROBE_STALL_ROUNDS = 3
+OFFLINE_RECOVERY_STATE_LIMIT = 512
+OFFLINE_SKIPPED_RETENTION_SECONDS = 14 * 24 * 60 * 60
+OFFLINE_RECOVERY_PROBE_INTERVAL_SECONDS = 60
+OFFLINE_MAX_U64 = (1 << 64) - 1
 GROUP_RECONNECT_INTERVAL = 5.0
 GROUP_HANDSHAKE_TIMEOUT = 45.0
 
@@ -804,6 +812,7 @@ class TermchatI2P(App):
 
         # Tracks received consumed indexes
         self.consumed_drop_recv = set()
+        self.reset_offline_recovery_state()
 
 
     def compose(self) -> ComposeResult:
@@ -1689,7 +1698,7 @@ class TermchatI2P(App):
         if version != PROTOCOL_VERSION:
             raise ValueError("Unsupported protocol version")
         
-        if msg_type not in b"UDSFCEKPOXLQYJGZ":
+        if msg_type not in b"UDISFCEKPOXLQYJGZ":
             raise ValueError("Unknown frame type")
 
     
@@ -1715,7 +1724,7 @@ class TermchatI2P(App):
         if version != PROTOCOL_VERSION:
             raise ValueError("Unsupported protocol version")
 
-        if msg_type not in b"UDSFCEKPOXLQYJGZ":
+        if msg_type not in b"UDISFCEKPOXLQYJGZ":
             raise ValueError("Unknown frame type")
 
         if length < 0 or length > MAX_FRAME_SIZE:
@@ -1924,6 +1933,8 @@ class TermchatI2P(App):
             if self.is_persistent_mode():
                 task = asyncio.create_task(self.send_deaddrop_server_list())
                 self.sam_runtime.track_send_task(task)
+
+            self.schedule_offline_index_sync_if_ready()
         
         
 
@@ -2054,7 +2065,7 @@ class TermchatI2P(App):
                 try:
                     msg_type, msg_id, payload = await self.read_frame(reader)
 
-                    if msg_type not in ('K', 'P', 'O', 'S', 'D', 'Z', 'X', 'L'):
+                    if msg_type not in ('K', 'P', 'O', 'S', 'D', 'Z', 'X', 'L', 'I'):
                         payload = self.e2e.decrypt(payload)
 
                 except UnicodeDecodeError:
@@ -2125,6 +2136,7 @@ class TermchatI2P(App):
             self.post("error", "Incoming caller disconnected.")
             return
 
+        self.reset_offline_connection_sync_state()
         reader, writer = self.pending_incoming_conn
         accepted_from = self.pending_incoming_addr or "Unknown"
         accepted_dest_b64 = self.pending_incoming_dest_b64
@@ -2183,6 +2195,7 @@ class TermchatI2P(App):
 
         if self.live_ready:
             self.post("system", "Secure session established 🔐")
+            self.schedule_offline_index_sync_if_ready()
 
         self.run_worker(self.receive_loop(self.conn))
     
@@ -2358,7 +2371,11 @@ class TermchatI2P(App):
 
     def get_deaddrop_recv_window(self):
         keys = []
-        for i in range(self.drop_recv_base, self.drop_recv_base + self.drop_window):
+        window_end = min(
+            OFFLINE_MAX_U64 + 1,
+            self.drop_recv_base + self.drop_window,
+        )
+        for i in range(self.drop_recv_base, window_end):
             if i in self.consumed_drop_recv:
                 continue
             keys.append((i, self.derive_deaddrop_key("recv", i)))
@@ -2366,8 +2383,55 @@ class TermchatI2P(App):
 
 
     def advance_drop_recv_base(self):
-        while self.drop_recv_base in self.consumed_drop_recv:
+        while (
+            self.drop_recv_base in self.consumed_drop_recv
+            or self.drop_recv_base in self.skipped_drop_recv
+        ):
+            if self.drop_recv_base == OFFLINE_MAX_U64:
+                self.consumed_drop_recv.discard(self.drop_recv_base)
+                self.skipped_drop_recv.pop(self.drop_recv_base, None)
+                break
             self.drop_recv_base += 1
+
+        self.consumed_drop_recv = {
+            index for index in self.consumed_drop_recv
+            if index >= self.drop_recv_base
+        }
+
+
+    def reset_offline_recovery_state(self):
+        self.known_remote_next_send = 0
+        self.highest_authenticated_recv_index = None
+        self.missing_drop_recv = {}
+        self.skipped_drop_recv = {}
+        self.forward_probe_index = 0
+        self.deaddrop_stalled_sweeps = 0
+        self.deaddrop_last_recovery_probe_ts = 0.0
+        self.offline_index_sync_sent = False
+
+
+    def reset_offline_connection_sync_state(self):
+        self.offline_index_sync_sent = False
+
+
+    @staticmethod
+    def parse_offline_u64(value, default=None):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        if parsed < 0 or parsed > OFFLINE_MAX_U64:
+            return default
+        return parsed
+
+
+    def bound_offline_recovery_state(self):
+        self.missing_drop_recv = dict(
+            sorted(self.missing_drop_recv.items())[:OFFLINE_RECOVERY_STATE_LIMIT]
+        )
+        self.skipped_drop_recv = dict(
+            sorted(self.skipped_drop_recv.items())[:OFFLINE_RECOVERY_STATE_LIMIT]
+        )
 
 
 
@@ -2439,25 +2503,87 @@ class TermchatI2P(App):
 
             if "offline_shared_secret" in data:
                 try:
-                    self.offline_shared_secret = bytes.fromhex(data["offline_shared_secret"])
+                    loaded_secret = bytes.fromhex(data["offline_shared_secret"])
+                    if len(loaded_secret) == 32:
+                        self.offline_shared_secret = loaded_secret
                 except:
-                    self.offline_shared_secret = b"CHANGE_ME_SHARED_OFFLINE_SECRET"
+                    pass
 
-            if "drop_send_index" in data:
-                self.drop_send_index = int(data["drop_send_index"])
+            loaded_send = self.parse_offline_u64(data.get("drop_send_index"), 0)
+            loaded_recv = self.parse_offline_u64(data.get("drop_recv_base"), 0)
+            self.drop_send_index = max(self.drop_send_index, loaded_send)
+            self.drop_recv_base = max(self.drop_recv_base, loaded_recv)
 
-            if "drop_recv_base" in data:
-                self.drop_recv_base = int(data["drop_recv_base"])
+            try:
+                loaded_window = int(data.get("drop_window", self.drop_window))
+                if 0 < loaded_window <= 0xFFFFFFFF:
+                    self.drop_window = loaded_window
+            except (TypeError, ValueError):
+                pass
 
-            if "drop_window" in data:
-                self.drop_window = int(data["drop_window"])
+            consumed = set()
+            for value in data.get("consumed_drop_recv", "").split(","):
+                index = self.parse_offline_u64(value.strip())
+                if index is not None:
+                    consumed.add(index)
+            self.consumed_drop_recv = consumed
 
-            if "consumed_drop_recv" in data and data["consumed_drop_recv"]:
-                self.consumed_drop_recv = set(
-                    int(x) for x in data["consumed_drop_recv"].split(",") if x.strip()
-                )
-            else:
-                self.consumed_drop_recv = set()
+            loaded_known = self.parse_offline_u64(data.get("known_remote_next_send"), 0)
+            self.known_remote_next_send = max(
+                self.known_remote_next_send,
+                loaded_known,
+                self.drop_recv_base,
+            )
+
+            loaded_highest = self.parse_offline_u64(data.get("highest_authenticated_recv_index"))
+            if loaded_highest is not None:
+                if self.highest_authenticated_recv_index is None:
+                    self.highest_authenticated_recv_index = loaded_highest
+                else:
+                    self.highest_authenticated_recv_index = max(
+                        self.highest_authenticated_recv_index,
+                        loaded_highest,
+                    )
+
+            missing = {}
+            for raw_entry in data.get("missing_drop_recv", "").split(","):
+                parts = raw_entry.split(":")
+                if len(parts) != 4:
+                    continue
+                index = self.parse_offline_u64(parts[0])
+                rounds = self.parse_offline_u64(parts[1])
+                first_miss_ms = self.parse_offline_u64(parts[2])
+                last_miss_ms = self.parse_offline_u64(parts[3])
+                if None in (index, rounds, first_miss_ms, last_miss_ms):
+                    continue
+                if rounds > 0xFFFFFFFF:
+                    continue
+                missing[index] = {
+                    "confirmed_miss_rounds": rounds,
+                    "first_miss_ms": first_miss_ms,
+                    "last_miss_ms": last_miss_ms,
+                }
+            self.missing_drop_recv = missing
+
+            skipped = {}
+            for raw_entry in data.get("skipped_drop_recv", "").split(","):
+                parts = raw_entry.split(":")
+                if len(parts) != 3:
+                    continue
+                index = self.parse_offline_u64(parts[0])
+                skipped_at_ms = self.parse_offline_u64(parts[1])
+                last_probe_ms = self.parse_offline_u64(parts[2])
+                if None in (index, skipped_at_ms, last_probe_ms):
+                    continue
+                skipped[index] = {
+                    "skipped_at_ms": skipped_at_ms,
+                    "last_recovery_probe_ms": last_probe_ms,
+                }
+            self.skipped_drop_recv = skipped
+
+            loaded_probe = self.parse_offline_u64(data.get("forward_probe_index"), 0)
+            self.forward_probe_index = max(self.forward_probe_index, loaded_probe)
+            self.bound_offline_recovery_state()
 
             self.post("system", f"Loaded offline state for {self.stored_peer}")
 
@@ -2478,6 +2604,20 @@ class TermchatI2P(App):
             content += f"drop_recv_base={self.drop_recv_base}\n"
             content += f"drop_window={self.drop_window}\n"
             content += "consumed_drop_recv=" + ",".join(str(x) for x in sorted(self.consumed_drop_recv)) + "\n"
+            content += f"known_remote_next_send={self.known_remote_next_send}\n"
+            content += "highest_authenticated_recv_index="
+            if self.highest_authenticated_recv_index is not None:
+                content += str(self.highest_authenticated_recv_index)
+            content += "\n"
+            content += "missing_drop_recv=" + ",".join(
+                f"{index}:{entry['confirmed_miss_rounds']}:{entry['first_miss_ms']}:{entry['last_miss_ms']}"
+                for index, entry in sorted(self.missing_drop_recv.items())
+            ) + "\n"
+            content += "skipped_drop_recv=" + ",".join(
+                f"{index}:{entry['skipped_at_ms']}:{entry['last_recovery_probe_ms']}"
+                for index, entry in sorted(self.skipped_drop_recv.items())
+            ) + "\n"
+            content += f"forward_probe_index={self.forward_probe_index}\n"
 
             secure_write_text_atomic(path, content)
 
@@ -2509,6 +2649,7 @@ class TermchatI2P(App):
         self.drop_recv_base = 0
         self.drop_window = 8
         self.consumed_drop_recv = set()
+        self.reset_offline_recovery_state()
 
         self.offline_mode = False
         self.seen_drop_msgs = set()
@@ -2573,6 +2714,7 @@ class TermchatI2P(App):
             await writer.drain()
 
             self.post("system", "Offline secret sent to locked peer.")
+            self.schedule_offline_index_sync_if_ready()
         except Exception as e:
             self.post("error", f"Failed to send offline secret: {e}")
 
@@ -2610,6 +2752,53 @@ class TermchatI2P(App):
             await self.send_offline_secret_if_needed()
         else:
             await self.request_offline_secret_if_needed()
+
+
+    def can_send_offline_index_sync(self):
+        return (
+            self.is_persistent_mode()
+            and self.conn is not None
+            and self.live_ready
+            and self.e2e.ready()
+            and self.tofu_verified
+            and self.has_real_offline_secret()
+            and bool(self.stored_peer)
+            and bool(self.stored_peer_dest_b64)
+            and self.current_peer_addr == self.stored_peer
+            and self.current_peer_dest_b64 == self.stored_peer_dest_b64
+        )
+
+
+    def schedule_offline_index_sync_if_ready(self):
+        if self.offline_index_sync_sent or not self.can_send_offline_index_sync():
+            return
+
+        self.offline_index_sync_sent = True
+        task = asyncio.create_task(self.send_offline_index_sync())
+        self.sam_runtime.track_send_task(task)
+
+
+    async def send_offline_index_sync(self):
+        try:
+            if not self.conn or not self.can_send_offline_index_sync():
+                return
+            if not (0 <= self.drop_send_index <= OFFLINE_MAX_U64):
+                raise ValueError("offline send index is outside u64 range")
+            if not (0 <= self.drop_recv_base <= OFFLINE_MAX_U64):
+                raise ValueError("offline receive base is outside u64 range")
+
+            plaintext = struct.pack(
+                ">BQQ",
+                OFFLINE_INDEX_SYNC_VERSION,
+                self.drop_send_index,
+                self.drop_recv_base,
+            )
+            payload = self.e2e.encrypt_strict(plaintext)
+            _, writer = self.conn
+            writer.write(self.frame_message('I', payload))
+            await writer.drain()
+        except Exception as e:
+            self.post("error", f"Offline index sync failed: {e}")
 
 
 
@@ -3541,13 +3730,14 @@ class TermchatI2P(App):
 
                     self.stored_peer = self.current_peer_addr
                     self.stored_peer_dest_b64 = self.current_peer_dest_b64
-                    self.tofu_mismatch = False
+                    self.set_tofu_verified()
 
                     # Initialize and persist offline state for this locked peer
                     self.drop_send_index = 0
                     self.drop_recv_base = 0
                     self.drop_window = 8
                     self.consumed_drop_recv = set()
+                    self.reset_offline_recovery_state()
 
                     self.save_offline_state()
                     
@@ -3558,6 +3748,9 @@ class TermchatI2P(App):
                     fp = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
                     self.post("success", f"Profile {self.profile} is now locked to this peer.")
                     self.post("system", f"TOFU peer pin saved: {fp}")
+
+                    task = asyncio.create_task(self.sync_offline_secret_if_needed())
+                    self.sam_runtime.track_send_task(task)
                 except Exception as e:
                     self.post("error", f"Failed to save: {e}")
             else:
@@ -3607,6 +3800,7 @@ class TermchatI2P(App):
                 self.drop_recv_base = 0
                 self.drop_window = 8
                 self.consumed_drop_recv = set()
+                self.reset_offline_recovery_state()
                 self.seen_drop_msgs = set()
                 self.dd_status = "idle"
                 self.dd_status_ts = 0.0
@@ -3818,7 +4012,8 @@ class TermchatI2P(App):
         try:
             if self.sam_runtime.is_closing():
                 return
-            
+
+            self.reset_offline_connection_sync_state()
             self.current_peer_addr = target_address
             
             reader, writer = await self.sam_runtime.stream_connect(target_address)
@@ -3976,7 +4171,7 @@ class TermchatI2P(App):
                         self.mark_heartbeat_rx()
                     
                     # Decrypt payload if encrypted
-                    if msg_type not in ('K','P','O','S','D','Z','X','L'):
+                    if msg_type not in ('K','P','O','S','D','Z','X','L','I'):
                         payload = self.e2e.decrypt(payload)
                     
                 except UnicodeDecodeError:
@@ -4006,6 +4201,7 @@ class TermchatI2P(App):
                 self.conn = None
                 self.live_ready = False
                 self.pq_active = False
+                self.reset_offline_connection_sync_state()
                 self.current_peer_dest_b64 = None
                 self.post("disconnect", "Peer disconnected.")
                 self.peer_b32 = "Waiting for incoming connections..."
@@ -4306,6 +4502,8 @@ class TermchatI2P(App):
                     else:
                         self.post("info", f"Peer Identity: {peer_addr}")
 
+                    self.schedule_offline_index_sync_if_ready()
+
                 except:
                     pass
 
@@ -4336,6 +4534,8 @@ class TermchatI2P(App):
                 if self.is_persistent_mode():
                     task = asyncio.create_task(self.send_deaddrop_server_list())
                     self.sam_runtime.track_send_task(task)
+
+                self.schedule_offline_index_sync_if_ready()
                 
             except Exception as e:
                 self.post("error", f"E2E key error: {e}")
@@ -4387,6 +4587,55 @@ class TermchatI2P(App):
 
                 
                 
+        elif msg_type == 'I':
+            if source != "live" or not (
+                self.is_persistent_mode()
+                and self.stored_peer
+                and self.stored_peer_dest_b64
+                and self.tofu_verified
+                and self.live_ready
+                and self.e2e.ready()
+                and self.current_peer_addr == self.stored_peer
+                and self.current_peer_dest_b64 == self.stored_peer_dest_b64
+            ):
+                self.post("error", "Received offline index sync outside a verified persistent secure session.")
+                return
+
+            try:
+                plaintext = self.e2e.decrypt_strict(payload)
+            except Exception as e:
+                self.post("error", f"Offline index sync authentication failed: {e}")
+                return
+
+            if len(plaintext) != OFFLINE_INDEX_SYNC_PAYLOAD_LEN:
+                self.post("error", "Invalid offline index sync payload.")
+                return
+
+            try:
+                version, remote_next_send, remote_receive_base = struct.unpack(">BQQ", plaintext)
+            except struct.error:
+                self.post("error", "Invalid offline index sync payload.")
+                return
+
+            if version != OFFLINE_INDEX_SYNC_VERSION:
+                self.post("error", "Invalid offline index sync payload.")
+                return
+
+            old_send = self.drop_send_index
+            old_known = self.known_remote_next_send
+            self.drop_send_index = max(self.drop_send_index, remote_receive_base)
+            self.known_remote_next_send = max(
+                self.known_remote_next_send,
+                remote_next_send,
+            )
+            self.save_offline_state()
+
+            if old_send != self.drop_send_index or old_known != self.known_remote_next_send:
+                self.post(
+                    "system",
+                    f"Offline indexes synchronized: send={self.drop_send_index}, remote_next={self.known_remote_next_send}.",
+                )
+
         elif msg_type == 'X':
             try:
                 if source != "live" or not (
@@ -4419,6 +4668,7 @@ class TermchatI2P(App):
                 self.offline_shared_secret = secret
                 self.save_offline_state()
                 self.post("system", "Offline secret received and saved.")
+                self.schedule_offline_index_sync_if_ready()
             except Exception as e:
                 self.post("error", f"Offline secret handling failed: {e}")
              
@@ -6285,6 +6535,7 @@ class TermchatI2P(App):
             self.conn = None
             self.live_ready = False
             self.pq_active = False
+            self.reset_offline_connection_sync_state()
             self.stop_heartbeat()
             self.current_peer_dest_b64 = None
             self.peer_b32 = "Waiting for incoming connections..."
@@ -6463,6 +6714,127 @@ class TermchatI2P(App):
             await asyncio.sleep(0.2)
 
 
+    def build_offline_poll_targets(self, now_ms):
+        targets = [
+            (index, key, "window")
+            for index, key in self.get_deaddrop_recv_window()
+        ]
+
+        if self.deaddrop_stalled_sweeps >= OFFLINE_FORWARD_PROBE_STALL_ROUNDS:
+            window_end = min(
+                OFFLINE_MAX_U64,
+                self.drop_recv_base + self.drop_window,
+            )
+            probe_index = max(self.forward_probe_index, window_end)
+            if probe_index <= OFFLINE_MAX_U64:
+                targets.append((
+                    probe_index,
+                    self.derive_deaddrop_key("recv", probe_index),
+                    "forward",
+                ))
+                self.forward_probe_index = min(OFFLINE_MAX_U64, probe_index + 1)
+
+        recovery_interval_ms = OFFLINE_RECOVERY_PROBE_INTERVAL_SECONDS * 1000
+        if now_ms - int(self.deaddrop_last_recovery_probe_ts * 1000) >= recovery_interval_ms:
+            for index, entry in sorted(self.skipped_drop_recv.items()):
+                if now_ms - entry["last_recovery_probe_ms"] < recovery_interval_ms:
+                    continue
+                entry["last_recovery_probe_ms"] = now_ms
+                self.deaddrop_last_recovery_probe_ts = now_ms / 1000.0
+                targets.append((
+                    index,
+                    self.derive_deaddrop_key("recv", index),
+                    "recovery",
+                ))
+                break
+
+        return targets
+
+
+    def record_authenticated_offline_index(self, recv_index):
+        next_index = min(OFFLINE_MAX_U64, recv_index + 1)
+        self.known_remote_next_send = max(
+            self.known_remote_next_send,
+            next_index,
+        )
+
+        if self.highest_authenticated_recv_index is None:
+            self.highest_authenticated_recv_index = recv_index
+        else:
+            self.highest_authenticated_recv_index = max(
+                self.highest_authenticated_recv_index,
+                recv_index,
+            )
+
+        self.missing_drop_recv.pop(recv_index, None)
+        self.skipped_drop_recv.pop(recv_index, None)
+
+        if recv_index >= self.drop_recv_base:
+            self.consumed_drop_recv.add(recv_index)
+
+        self.advance_drop_recv_base()
+
+
+    def finalize_offline_poll_sweep(self, confirmed_misses, authenticated_indexes, now_ms):
+        for index in sorted(set(confirmed_misses) - set(authenticated_indexes)):
+            entry = self.missing_drop_recv.get(index)
+            if entry is None:
+                self.missing_drop_recv[index] = {
+                    "confirmed_miss_rounds": 1,
+                    "first_miss_ms": now_ms,
+                    "last_miss_ms": now_ms,
+                }
+            else:
+                entry["confirmed_miss_rounds"] = min(
+                    0xFFFFFFFF,
+                    entry["confirmed_miss_rounds"] + 1,
+                )
+                entry["last_miss_ms"] = now_ms
+
+        for index, entry in list(self.missing_drop_recv.items()):
+            if not (
+                entry["confirmed_miss_rounds"] >= OFFLINE_GAP_MISS_ROUNDS
+                and self.drop_recv_base <= index < self.known_remote_next_send
+            ):
+                continue
+            if index not in self.skipped_drop_recv:
+                self.skipped_drop_recv[index] = {
+                    "skipped_at_ms": now_ms,
+                    "last_recovery_probe_ms": 0,
+                }
+                self.post(
+                    "system",
+                    f"Skipped confirmed offline gap at recv index {index}; late recovery remains active.",
+                )
+
+        for index in self.skipped_drop_recv:
+            self.missing_drop_recv.pop(index, None)
+
+        retention_ms = OFFLINE_SKIPPED_RETENTION_SECONDS * 1000
+        self.skipped_drop_recv = {
+            index: entry
+            for index, entry in self.skipped_drop_recv.items()
+            if now_ms - entry["skipped_at_ms"] <= retention_ms
+        }
+        self.bound_offline_recovery_state()
+
+        previous_base = self.drop_recv_base
+        self.advance_drop_recv_base()
+        if previous_base != self.drop_recv_base or authenticated_indexes:
+            self.deaddrop_stalled_sweeps = 0
+            self.forward_probe_index = min(
+                OFFLINE_MAX_U64,
+                self.drop_recv_base + self.drop_window,
+            )
+        else:
+            self.deaddrop_stalled_sweeps = min(
+                0xFFFFFFFF,
+                self.deaddrop_stalled_sweeps + 1,
+            )
+
+        self.save_offline_state()
+
+
 
     async def poll_deaddrops(self):
         await asyncio.sleep(2)  # let client fully start
@@ -6482,60 +6854,82 @@ class TermchatI2P(App):
                     await asyncio.sleep(5)
                     continue
 
-                recv_window = self.get_deaddrop_recv_window()
+                now_ms = int(time.time() * 1000)
+                recv_window = self.build_offline_poll_targets(now_ms)
                 blob_key = self.get_offline_blob_key()
                 self.set_dd_status("poll")
+                confirmed_misses = set()
+                authenticated_indexes = set()
 
-                for recv_index, dd_key in recv_window:
+                for recv_index, dd_key, poll_kind in recv_window:
                     try:
-                        blobs = await self.deaddrop.get(dd_key)
+                        blobs, stats = await self.deaddrop.get_with_stats(dd_key)
 
                         if not blobs:
                             self.set_dd_status("get_miss")
+                            confirmed_miss = any(
+                                stat["ok"] and stat["detail"].upper() == "MISS"
+                                for stat in stats
+                            )
+                            if confirmed_miss and poll_kind != "recovery":
+                                confirmed_misses.add(recv_index)
+                            elif not confirmed_miss:
+                                self.post(
+                                    "status",
+                                    f"Offline poll at index {recv_index} was indeterminate; no server confirmed MISS.",
+                                )
                             continue
-                        
-                        self.set_dd_status("get_hit")
 
                         got_valid_blob = False
-
-                        
                         for drop, blob in blobs:
-                            
-                            self.prefer_deaddrop_server(drop)
-                            
                             try:
                                 blob_hash = hashlib.sha256(blob).hexdigest()
 
                                 if blob_hash in self.seen_drop_msgs:
                                     continue
 
-                                frame = self.e2e.decrypt_offline_blob(blob, blob_key)
+                                frame = self.e2e.decrypt_offline_blob_strict(blob, blob_key)
                                 msg_type, msg_id, payload = self.parse_frame_bytes(frame)
+                                if msg_type != 'U':
+                                    self.post(
+                                        "error",
+                                        f"Ignoring offline frame type {msg_type} at recv index {recv_index}.",
+                                    )
+                                    continue
+
+                                message = self.e2e.decrypt(payload).decode("utf-8")
 
                                 self.seen_drop_msgs.add(blob_hash)
                                 got_valid_blob = True
-
-                                await self.handle_parsed_frame(
-                                    msg_type,
-                                    msg_id,
-                                    payload,
-                                    writer=None,
-                                    source="drop"
-                                )
-
-                                #self.post("system", f"[DROP] received type={msg_type} msg_id={msg_id} key_index={recv_index}")
+                                self.prefer_deaddrop_server(drop)
+                                self.post("peer_offline", message, msg_id=msg_id)
 
                             except Exception as e:
-                                self.post("error", f"[DROP parse error] {e}")
+                                self.post(
+                                    "error",
+                                    f"Rejected invalid or unauthenticated offline blob at recv index {recv_index}: {e}",
+                                )
 
                         if got_valid_blob:
-                            self.consumed_drop_recv.add(recv_index)
-                            self.advance_drop_recv_base()
-                            self.save_offline_state()
+                            self.set_dd_status("get_hit")
+                            authenticated_indexes.add(recv_index)
+                            self.record_authenticated_offline_index(recv_index)
+                        else:
+                            self.set_dd_status("get_miss")
+                            self.post(
+                                "status",
+                                f"Offline blobs at recv index {recv_index} contained no authenticated message.",
+                            )
 
                     except Exception as e:
                         self.set_dd_status("get_fail")
                         self.post("error", f"[DROP key poll error] {e}")
+
+                self.finalize_offline_poll_sweep(
+                    confirmed_misses,
+                    authenticated_indexes,
+                    now_ms,
+                )
 
             except Exception as e:
                 self.set_dd_status("get_fail")

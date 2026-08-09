@@ -250,6 +250,7 @@ class DeadDropClient:
  
     async def _get_one(self, drop: str, key: str):
         started = time.monotonic()
+        writer = None
 
         try:
             print("[DD GET] CONNECTING TO:", drop)
@@ -261,40 +262,61 @@ class DeadDropClient:
             await asyncio.wait_for(writer.drain(), timeout=self.io_timeout)
 
             header = await asyncio.wait_for(reader.readline(), timeout=self.io_timeout)
+            if not header:
+                raise RuntimeError("GET unexpected EOF")
+
             resp_str = header.decode().strip()
             print("[DD GET HEADER]", resp_str)
 
             data = None
+            ok = False
+            detail = resp_str or "FAIL"
+            parts = resp_str.split()
 
-            if header.startswith(b"OK"):
-                size = int(header.split()[1])
+            if len(parts) == 2 and parts[0] == "OK":
+                size = int(parts[1])
+                if size < 0:
+                    raise ValueError("invalid GET size")
                 data = await asyncio.wait_for(reader.readexactly(size), timeout=self.io_timeout)
-
-            writer.close()
-            await writer.wait_closed()
+                ok = True
+                detail = "OK"
+            elif resp_str == "MISS":
+                ok = True
+                detail = "MISS"
+            elif resp_str == "ERR":
+                detail = "ERR"
+            else:
+                raise RuntimeError(f"unexpected GET response: {resp_str}")
 
             latency_ms = (time.monotonic() - started) * 1000.0
-
-            if header.startswith(b"OK"):
-                self._report_stat("get", drop, True, latency_ms, "OK")
-            elif header.startswith(b"MISS"):
-                self._report_stat("get", drop, True, latency_ms, "MISS")
-            else:
-                self._report_stat("get", drop, False, latency_ms, resp_str or "FAIL")
-
-            return (drop, data)
+            self._report_stat("get", drop, ok, latency_ms, detail)
+            return (drop, data, ok, detail, latency_ms)
 
         except Exception as e:
             latency_ms = (time.monotonic() - started) * 1000.0
             print(f"[DROP GET FAIL] {drop}: {e}")
-            self._report_stat("get", drop, False, latency_ms, type(e).__name__)
-            return (drop, None)
+            detail = str(e) or type(e).__name__
+            self._report_stat("get", drop, False, latency_ms, detail)
+            return (drop, None, False, detail, latency_ms)
+
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
  
  
  
     
     
     async def get(self, key: str):
+        good, _ = await self.get_with_stats(key)
+        return good
+
+
+    async def get_with_stats(self, key: str):
         tasks = [
             asyncio.create_task(self._get_one(drop, key))
             for drop in self.drops
@@ -302,8 +324,17 @@ class DeadDropClient:
 
         results = await asyncio.gather(*tasks, return_exceptions=False)
 
-        good = [(drop, data) for drop, data in results if data is not None]
-        return good
+        good = [(drop, data) for drop, data, _, _, _ in results if data is not None]
+        stats = [
+            {
+                "drop": drop,
+                "ok": ok,
+                "detail": detail,
+                "latency_ms": latency_ms,
+            }
+            for drop, _, ok, detail, latency_ms in results
+        ]
+        return good, stats
 
     
     async def close(self):
