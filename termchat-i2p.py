@@ -1,5 +1,5 @@
 APP_NAME = "Termchat-I2P"
-APP_VERSION = "1.0.0-rc2"
+APP_VERSION = "1.0.0"
 
 import sys, os
 import shutil

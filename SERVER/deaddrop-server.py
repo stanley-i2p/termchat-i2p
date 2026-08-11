@@ -1,5 +1,5 @@
 APP_NAME = "DeadDrop"
-APP_VERSION = "1.0.0-rc2"
+APP_VERSION = "1.0.0"
 
 
 import asyncio
