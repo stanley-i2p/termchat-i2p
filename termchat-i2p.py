@@ -699,6 +699,11 @@ class TermchatI2P(App):
         self.pending_incoming_task = None
         self.promoting_pending_incoming = False
         self.call_blink_on = True
+
+        self.connect_task = None
+        self.connect_generation = 0
+        self.connect_target = None
+        self.connection_direction = None
         
         self.tofu_verified = False
         self.tofu_mismatch = False
@@ -857,6 +862,9 @@ class TermchatI2P(App):
         elif self.pending_incoming_conn:
             hints = ["/accept", "/decline", "/logs", "/help"]
 
+        elif self.one_to_one_connect_active():
+            hints = ["/disconnect", "/logs", "/help"]
+
         elif self.conn and not self.live_ready:
             hints = ["/disconnect", "/logs", "/help"]
 
@@ -977,12 +985,17 @@ class TermchatI2P(App):
         dot, _, _ = status_map.get(self.network_status, status_map["initializing"])
     
         
+        is_connecting = self.one_to_one_connect_active() or bool(
+            self.conn and not self.live_ready
+        )
         is_active = "Waiting" not in new_val and "My Addr" not in new_val
         is_proven = getattr(self, 'proven', False)
         is_persistent = self.profile != "default"
     
         # Border / Title logic 
-        if is_proven:
+        if is_connecting:
+            border_col, title = "yellow", "TUNNELS READY"
+        elif is_proven:
             border_col, title = "green", "VERIFIED SESSION"
         elif is_active:
             border_col, title = "cyan", "ACTIVE SESSION"
@@ -1040,6 +1053,9 @@ class TermchatI2P(App):
         if transfer:
             conn_viz = transfer
 
+        elif is_connecting:
+            conn_viz = "[bold cyan]o[/] [dim]CONNECTING[/]"
+
         elif is_active:
             link_color = "green" if is_proven else "cyan"
             link_symbol = "●" if is_proven else "o"
@@ -1057,7 +1073,15 @@ class TermchatI2P(App):
         else:
             my_b32 = "----"
     
-        if is_active:
+        if is_connecting:
+            peer_addr = self.connect_target or self.current_peer_addr
+            if peer_addr:
+                clean_peer = peer_addr.replace(".b32.i2p", "")
+                peer_disp = f"{clean_peer[:6]}..{clean_peer[-6:]}"
+            else:
+                peer_disp = "??????"
+            right_content = f"[green]{my_b32}[/] [white]:[/] [cyan dim]{peer_disp}[/]"
+        elif is_active:
             
             peer_addr = getattr(self, 'current_peer_addr', None)
             
@@ -1935,6 +1959,73 @@ class TermchatI2P(App):
                 self.sam_runtime.track_send_task(task)
 
             self.schedule_offline_index_sync_if_ready()
+
+
+    def one_to_one_connect_active(self):
+        task = self.connect_task
+        return bool(task and not task.done())
+
+
+    def local_prefers_outbound(self, peer_b32: str) -> bool:
+        my_b32 = getattr(self, "my_b32", "") or ""
+        return bool(my_b32) and my_b32.lower() < (peer_b32 or "").lower()
+
+
+    def invalidate_one_to_one_connect(self, cancel=True):
+        task = self.connect_task
+        was_active = bool(task and not task.done())
+
+        self.connect_generation += 1
+        self.connect_task = None
+        self.connect_target = None
+
+        if cancel and was_active and task is not asyncio.current_task():
+            task.cancel()
+
+        return was_active
+
+
+    def reset_one_to_one_e2e(self):
+        self.e2e = E2E(pq_enabled=self.pq_enabled)
+        self.live_ready = False
+        self.pq_active = False
+        self.reset_offline_connection_sync_state()
+
+
+    async def close_one_to_one_writer(self, writer):
+        if writer is None:
+            return
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+    async def discard_pending_incoming_for_collision(self):
+        connection = self.pending_incoming_conn
+        task = self.pending_incoming_task
+
+        self.promoting_pending_incoming = True
+        self.clear_pending_incoming()
+        self.pending_incoming_task = None
+
+        try:
+            if task and task is not asyncio.current_task():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+        finally:
+            try:
+                if connection:
+                    _, writer = connection
+                    await self.close_one_to_one_writer(writer)
+            finally:
+                self.promoting_pending_incoming = False
         
         
 
@@ -1998,6 +2089,8 @@ class TermchatI2P(App):
 
                 if now - self.heartbeat_last_rx_ts >= HEARTBEAT_TIMEOUT:
                     self.post("disconnect", "Peer heartbeat timed out.")
+                    if self.conn == connection:
+                        self.invalidate_one_to_one_connect(cancel=True)
                     try:
                         writer.close()
                         await writer.wait_closed()
@@ -2101,7 +2194,8 @@ class TermchatI2P(App):
                     self.current_peer_dest_b64 = None
                     self.peer_b32 = "Waiting for incoming connections..."
                     self.clear_tofu_runtime_status()
-                    self.pq_active = False
+                    self.connection_direction = None
+                    self.reset_one_to_one_e2e()
                     
                     self.update_command_bar()
                     
@@ -2113,7 +2207,8 @@ class TermchatI2P(App):
                     except:
                         pass
 
-            self.pending_incoming_task = None
+            if self.pending_incoming_task is asyncio.current_task():
+                self.pending_incoming_task = None
     
     
     
@@ -2123,16 +2218,18 @@ class TermchatI2P(App):
             return
 
         if self.pending_incoming_is_dead():
-            
+            _, dead_writer = self.pending_incoming_conn
             self.clear_pending_incoming()
             self.current_peer_addr = None
             self.current_peer_dest_b64 = None
             self.peer_b32 = "Waiting for incoming connections..."
             self.clear_tofu_runtime_status()
-            self.pq_active = False
+            self.connection_direction = None
+            self.reset_one_to_one_e2e()
             
             self.update_command_bar()
-            
+
+            await self.close_one_to_one_writer(dead_writer)
             self.post("error", "Incoming caller disconnected.")
             return
 
@@ -2142,6 +2239,7 @@ class TermchatI2P(App):
         accepted_dest_b64 = self.pending_incoming_dest_b64
 
         self.promoting_pending_incoming = True
+        self.conn = (reader, writer)
 
         task = self.pending_incoming_task
         self.pending_incoming_task = None
@@ -2166,23 +2264,38 @@ class TermchatI2P(App):
         else:
             self.clear_tofu_runtime_status()
 
-        if hasattr(self, 'my_pub_dest_b64'):
-            writer.write(self.frame_message('S', self.my_pub_dest_b64))
-            await writer.drain()
-
-            writer.write(self.frame_message('K', self.e2e.public_bytes()))
-            await writer.drain()
-            
-            if self.pq_enabled:
-                writer.write(self.frame_message('Q', self.e2e.pq_public_bytes()))
+        try:
+            if hasattr(self, 'my_pub_dest_b64'):
+                writer.write(self.frame_message('S', self.my_pub_dest_b64))
                 await writer.drain()
+
+                writer.write(self.frame_message('K', self.e2e.public_bytes()))
+                await writer.drain()
+
+                if self.pq_enabled:
+                    writer.write(self.frame_message('Q', self.e2e.pq_public_bytes()))
+                    await writer.drain()
+        except Exception as e:
+            if self.conn == (reader, writer):
+                self.conn = None
+            self.connection_direction = None
+            self.current_peer_addr = None
+            self.current_peer_dest_b64 = None
+            self.peer_b32 = "Waiting for incoming connections..."
+            self.clear_tofu_runtime_status()
+            self.reset_one_to_one_e2e()
+            await self.close_one_to_one_writer(writer)
+            self.promoting_pending_incoming = False
+            self.watch_peer_b32(self.peer_b32)
+            self.update_command_bar()
+            self.post("error", f"Failed to accept incoming connection: {e}")
+            return
 
         if self.offline_mode:
             self.leave_offline_mode()
             self.watch_peer_b32(self.peer_b32)
             self.post("system", "Leaving OFFLINE mode due to accepted live incoming connection.")
 
-        self.conn = (reader, writer)
         self.live_ready = self.e2e.ready()
         self.start_heartbeat()
         
@@ -2207,16 +2320,18 @@ class TermchatI2P(App):
             return
 
         if self.pending_incoming_is_dead():
-            
+            _, dead_writer = self.pending_incoming_conn
             self.clear_pending_incoming()
             self.current_peer_addr = None
             self.current_peer_dest_b64 = None
             self.peer_b32 = "Waiting for incoming connections..."
             self.clear_tofu_runtime_status()
-            self.pq_active = False
+            self.connection_direction = None
+            self.reset_one_to_one_e2e()
             
             self.update_command_bar()
-            
+
+            await self.close_one_to_one_writer(dead_writer)
             self.post("system", "Incoming caller already disconnected.")
             return
 
@@ -2242,7 +2357,7 @@ class TermchatI2P(App):
         self.current_peer_dest_b64 = None
         self.peer_b32 = "Waiting for incoming connections..."
         self.clear_tofu_runtime_status()
-        self.pq_active = False
+        self.connection_direction = None
         
         self.update_command_bar()
 
@@ -2252,6 +2367,7 @@ class TermchatI2P(App):
         except:
             pass
 
+        self.reset_one_to_one_e2e()
         self.promoting_pending_incoming = False
 
         self.post("system", f"Declined incoming call from {declined_from[:12]}...")
@@ -2280,7 +2396,17 @@ class TermchatI2P(App):
             try:
                 if self.pending_incoming_conn and self.pending_incoming_is_dead():
                     caller = self.pending_incoming_addr or "Unknown"
+                    _, writer = self.pending_incoming_conn
                     self.clear_pending_incoming()
+                    self.current_peer_addr = None
+                    self.current_peer_dest_b64 = None
+                    self.peer_b32 = "Waiting for incoming connections..."
+                    self.connection_direction = None
+                    self.clear_tofu_runtime_status()
+                    self.reset_one_to_one_e2e()
+                    await self.close_one_to_one_writer(writer)
+                    self.watch_peer_b32(self.peer_b32)
+                    self.update_command_bar()
                     self.post("system", f"Incoming caller disconnected: {caller[:12]}...")
             except:
                 pass
@@ -3599,6 +3725,10 @@ class TermchatI2P(App):
             if self.conn:
                 self.post("error", "Cannot enter offline mode during active live chat.")
                 return
+
+            if self.pending_incoming_conn:
+                self.post("error", "Incoming call is pending. Use /accept or /decline first.")
+                return
             
             if self.offline_mode:
                 self.post("error", "Already in OFFLINE mode.")
@@ -3607,11 +3737,14 @@ class TermchatI2P(App):
             if not self.offline_ready():
                 self.post("error", "Offline mode requires persistent mode with a locked peer.")
                 return
-            
+
+            self.invalidate_one_to_one_connect(cancel=True)
+            self.connection_direction = None
+            self.reset_one_to_one_e2e()
+
             if not self.deaddrop_started or not self.deaddrop_poller_started:
                 self.post("system", "Starting offline runtime...")
                 await self.ensure_offline_runtime_started()
-            
 
             self.offline_mode = True
             self.watch_peer_b32(self.peer_b32)
@@ -3656,6 +3789,10 @@ class TermchatI2P(App):
             if self.conn:
                 self.post("error", "Already connected. Use /disconnect first.")
                 return
+
+            if self.one_to_one_connect_active():
+                self.post("error", "A connection attempt is already in progress. Use /disconnect to cancel it.")
+                return
             
             if self.pending_incoming_conn:
                 self.post("error", "Incoming call is pending. Use /accept or /decline first.")
@@ -3682,11 +3819,11 @@ class TermchatI2P(App):
             if len(parts) > 1:
                 # User provided address
                 target = parts[1].strip()
-                self.run_worker(self.connect_to_peer(target))
+                self.start_one_to_one_connect(target)
             elif self.stored_peer:
                 # User typed /connect with no arguments
                 self.post("system", f"Connecting to stored contact...")
-                self.run_worker(self.connect_to_peer(self.stored_peer))
+                self.start_one_to_one_connect(self.stored_peer)
             else:
                 self.post("error", "No stored contact. Use /connect <address>")
                 
@@ -4005,63 +4142,161 @@ class TermchatI2P(App):
             
             
 
-    async def connect_to_peer(self, target_address):
+    def connect_attempt_is_current(self, generation, target_address, task=None):
+        if self.sam_runtime.is_closing():
+            return False
+        if generation != self.connect_generation:
+            return False
+        if (self.connect_target or "").lower() != (target_address or "").lower():
+            return False
+        if task is not None and self.connect_task is not task:
+            return False
+        return self.one_to_one_connect_active()
+
+
+    def start_one_to_one_connect(self, target_address):
+        target_address = (target_address or "").strip()
+        if not target_address:
+            self.post("error", "No destination was provided.")
+            return False
+        if self.sam_runtime.is_closing() or self.offline_mode:
+            self.post("error", "Cannot connect while this session is unavailable.")
+            return False
+        if self.one_to_one_connect_active():
+            self.post("error", "A connection attempt is already in progress.")
+            return False
+        if self.conn or self.pending_incoming_conn:
+            self.post("error", "Another connection or incoming call is already active.")
+            return False
+
+        self.connect_generation += 1
+        generation = self.connect_generation
+        self.connect_target = target_address
+        self.connection_direction = None
+        self.reset_offline_connection_sync_state()
+
+        task = asyncio.create_task(self.connect_to_peer(target_address, generation))
+        self.connect_task = self.sam_runtime.track_connect_task(task)
+        self.watch_peer_b32(self.peer_b32)
+        self.update_command_bar()
+        self.post("system", f"Connecting to {target_address[:12]}...")
+        return True
+
+
+    async def connect_to_peer(self, target_address, generation):
+        await asyncio.sleep(0)
         current_task = asyncio.current_task()
-        if current_task:
-            self.sam_runtime.track_connect_task(current_task)
+        reader = None
+        writer = None
+        connection = None
+
         try:
-            if self.sam_runtime.is_closing():
+            if not self.connect_attempt_is_current(generation, target_address, current_task):
                 return
 
-            self.reset_offline_connection_sync_state()
-            self.current_peer_addr = target_address
-            
             reader, writer = await self.sam_runtime.stream_connect(target_address)
-            
-            
-            if hasattr(self, 'my_dest_b64'):
-                # Send raw B64 address in single line
+            connection = (reader, writer)
+
+            if not self.connect_attempt_is_current(generation, target_address, current_task):
+                await self.close_one_to_one_writer(writer)
+                return
+
+            if self.conn:
+                self.post("system", f"Connection collision: kept established session with {target_address[:12]}...")
+                await self.close_one_to_one_writer(writer)
+                return
+
+            if self.pending_incoming_conn:
+                same_peer = bool(
+                    self.pending_incoming_addr
+                    and self.pending_incoming_addr.lower() == target_address.lower()
+                )
+                if not same_peer or not self.local_prefers_outbound(target_address):
+                    if same_peer:
+                        self.post("system", f"Connection collision: kept inbound session with {target_address[:12]}...")
+                    else:
+                        pending = self.pending_incoming_addr or "unknown peer"
+                        self.post("system", f"Connect result ignored while an incoming call is pending from {pending[:12]}...")
+                    await self.close_one_to_one_writer(writer)
+                    return
+
+                self.post("system", f"Connection collision: kept outbound session with {target_address[:12]}...")
+                await self.discard_pending_incoming_for_collision()
+
+                if not self.connect_attempt_is_current(generation, target_address, current_task):
+                    await self.close_one_to_one_writer(writer)
+                    return
+                if self.conn or self.pending_incoming_conn:
+                    await self.close_one_to_one_writer(writer)
+                    return
+
+            self.reset_one_to_one_e2e()
+            self.conn = connection
+            self.connection_direction = "outbound"
+            self.current_peer_addr = target_address
+            self.current_peer_dest_b64 = None
+            self.peer_b32 = target_address
+            self.clear_tofu_runtime_status()
+
+            if hasattr(self, 'my_pub_dest_b64'):
                 writer.write(self.my_pub_dest_b64.encode() + b"\n")
-                # Send 'S' frame to sync state machine
                 writer.write(self.frame_message('S', self.my_pub_dest_b64))
                 await writer.drain()
-                
-                # Send E2E key
+
                 writer.write(self.frame_message('K', self.e2e.public_bytes()))
                 await writer.drain()
-                
+
                 if self.pq_enabled:
                     writer.write(self.frame_message('Q', self.e2e.pq_public_bytes()))
                     await writer.drain()
-                        
-                
-                self.proven = True 
-                self.network_status = "visible" 
-                self.watch_peer_b32(self.peer_b32) 
 
+                self.proven = True
+                self.network_status = "visible"
 
-            self.conn = (reader, writer)
-            self.live_ready = False
-            
             self.watch_peer_b32(self.peer_b32)
             self.update_command_bar()
-            
             self.post("success", "Handshake sent. Establishing tunnel...")
-            self.run_worker(self.receive_loop(self.conn)) 
-            
-        
+            self.run_worker(self.receive_loop(connection))
+
+        except asyncio.CancelledError:
+            if connection and self.conn == connection:
+                self.conn = None
+                self.connection_direction = None
+                self.current_peer_addr = None
+                self.current_peer_dest_b64 = None
+                self.reset_one_to_one_e2e()
+            if writer is not None:
+                await self.close_one_to_one_writer(writer)
+            raise
         except SamRuntimeClosed:
-            self.conn = None
-            self.live_ready = False
+            if writer is not None:
+                await self.close_one_to_one_writer(writer)
         except Exception as e:
-            self.post("error", f"Connection failed: {e}")
-            self.conn = None
-            self.live_ready = False
-            self.post("system", "Waiting for incoming connections...")
-        
-
-
-
+            owns_attempt = self.connect_attempt_is_current(
+                generation,
+                target_address,
+                current_task,
+            )
+            if connection and self.conn == connection:
+                self.conn = None
+                self.connection_direction = None
+                self.current_peer_addr = None
+                self.current_peer_dest_b64 = None
+                self.reset_one_to_one_e2e()
+            if writer is not None:
+                await self.close_one_to_one_writer(writer)
+            if owns_attempt:
+                self.post("error", f"Connection failed: {e}")
+                self.post("system", "Waiting for incoming connections...")
+        finally:
+            if self.connect_task is current_task:
+                self.connect_task = None
+                if generation == self.connect_generation:
+                    self.connect_target = None
+                    if not self.conn and not self.pending_incoming_conn and not self.offline_mode:
+                        self.peer_b32 = "Waiting for incoming connections..."
+                self.watch_peer_b32(self.peer_b32)
+                self.update_command_bar()
 
 
     async def accept_loop(self):
@@ -4072,88 +4307,112 @@ class TermchatI2P(App):
             if self.sam_runtime.is_closing():
                 return
 
-            
-            if self.conn or self.pending_incoming_conn:
+            if self.conn or self.pending_incoming_conn or self.promoting_pending_incoming:
                 await asyncio.sleep(1)
                 continue
-            
+
+            writer = None
             try:
-                
                 reader, writer = await self.sam_runtime.stream_accept()
-                
+
                 try:
                     peer_identity_line = await asyncio.wait_for(reader.readline(), timeout=10.0)
                 except asyncio.TimeoutError:
-                    writer.close()
+                    await self.close_one_to_one_writer(writer)
                     continue
-                
-                
+
                 if not peer_identity_line:
-                    writer.close()
+                    await self.close_one_to_one_writer(writer)
                     continue
-                
-                
+
                 try:
                     raw_dest = peer_identity_line.decode().strip()
-                    
                     peer_addr = self.sam.destination_to_b32(raw_dest)
-                    
-                    # If profile is LOCKED, verify calling peer b32
-                    if self.stored_peer and peer_addr != self.stored_peer:
-                        self.post("error", f"Blocked unauthorized call from {peer_addr}...")
-                        writer.close()
-                        continue
-                    
-                    
-                    # TOFU check on b64 destination if pinned
-                    if self.stored_peer_dest_b64 and raw_dest != self.stored_peer_dest_b64:
-                        fp_old = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
-                        fp_new = self.peer_dest_fingerprint(raw_dest)
-                        self.set_tofu_mismatch()
-                        self.post("error", f"TOFU mismatch for {peer_addr}: expected {fp_old}, got {fp_new}")
-                        writer.close()
-                        continue
-                 
-                    
-                    self.current_peer_addr = peer_addr
-                    self.current_peer_dest_b64 = raw_dest
-                    self.peer_b32 = peer_addr
-
-                    if self.stored_peer_dest_b64:
-                        self.set_tofu_verified()
-                    else:
-                        self.clear_tofu_runtime_status()
-
-                    #self.post("success", f"Connection accepted from {peer_addr[:12]}...")
-                except:
-                    peer_addr = "Unknown"
-
-                if self.pending_incoming_conn:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except:
-                        pass
+                except Exception as e:
+                    self.post("error", f"Rejected caller with invalid identity: {e}")
+                    await self.close_one_to_one_writer(writer)
                     continue
 
+                if self.conn:
+                    self.post("system", f"Connection collision: kept established session with {peer_addr[:12]}...")
+                    await self.close_one_to_one_writer(writer)
+                    continue
+
+                if self.pending_incoming_conn:
+                    pending = self.pending_incoming_addr or "unknown peer"
+                    self.post("system", f"Connection collision: kept existing incoming call from {pending[:12]}...")
+                    await self.close_one_to_one_writer(writer)
+                    continue
+
+                if self.stored_peer and peer_addr.lower() != self.stored_peer.lower():
+                    self.post("error", f"Blocked unauthorized call from {peer_addr}...")
+                    await self.close_one_to_one_writer(writer)
+                    continue
+
+                if self.stored_peer_dest_b64 and raw_dest != self.stored_peer_dest_b64:
+                    fp_old = self.peer_dest_fingerprint(self.stored_peer_dest_b64)
+                    fp_new = self.peer_dest_fingerprint(raw_dest)
+                    if not self.one_to_one_connect_active():
+                        self.set_tofu_mismatch()
+                    self.post("error", f"TOFU mismatch for {peer_addr}: expected {fp_old}, got {fp_new}")
+                    await self.close_one_to_one_writer(writer)
+                    continue
+
+                if self.one_to_one_connect_active():
+                    same_peer = bool(
+                        self.connect_target
+                        and self.connect_target.lower() == peer_addr.lower()
+                    )
+                    if not same_peer:
+                        self.post("system", f"Incoming call from {peer_addr[:12]}... rejected while connecting to another peer.")
+                        await self.close_one_to_one_writer(writer)
+                        continue
+                    if self.local_prefers_outbound(peer_addr):
+                        self.post("system", f"Connection collision: kept outbound session with {peer_addr[:12]}...")
+                        await self.close_one_to_one_writer(writer)
+                        continue
+
+                    self.post("system", f"Connection collision: kept inbound session with {peer_addr[:12]}...")
+                    self.invalidate_one_to_one_connect(cancel=True)
+
+                self.reset_one_to_one_e2e()
+                self.current_peer_addr = peer_addr
+                self.current_peer_dest_b64 = raw_dest
+                self.peer_b32 = peer_addr
+                self.connection_direction = "inbound"
+
+                if self.stored_peer_dest_b64:
+                    self.set_tofu_verified()
+                else:
+                    self.clear_tofu_runtime_status()
+
                 self.pending_incoming_conn = (reader, writer)
-                self.pending_incoming_addr = self.current_peer_addr
-                self.pending_incoming_dest_b64 = self.current_peer_dest_b64
-                
+                self.pending_incoming_addr = peer_addr
+                self.pending_incoming_dest_b64 = raw_dest
+
                 self.pending_incoming_task = asyncio.create_task(
                     self.pending_receive_loop(self.pending_incoming_conn)
                 )
-                
+
                 self.watch_peer_b32(self.peer_b32)
 
-                caller = self.pending_incoming_addr or "Unknown"
-                self.post("system", f"Incoming call from {caller[:12]}... Type /accept or /decline.")
-            
+                self.post("system", f"Incoming call from {peer_addr[:12]}... Type /accept or /decline.")
+
             except SamRuntimeClosed:
                 break
             except asyncio.CancelledError:
+                if writer is not None and not (
+                    self.pending_incoming_conn
+                    and self.pending_incoming_conn[1] is writer
+                ):
+                    await self.close_one_to_one_writer(writer)
                 break
-            except Exception as e:
+            except Exception:
+                if writer is not None and not (
+                    self.pending_incoming_conn
+                    and self.pending_incoming_conn[1] is writer
+                ):
+                    await self.close_one_to_one_writer(writer)
                 await asyncio.sleep(1)
 
 
@@ -4193,15 +4452,15 @@ class TermchatI2P(App):
 
         finally:
             if self.conn == connection:
-                
+                self.invalidate_one_to_one_connect(cancel=True)
                 self.reset_transfer_state()
                 self.stop_heartbeat()
                 self.watch_peer_b32(self.peer_b32)
                 
                 self.conn = None
-                self.live_ready = False
-                self.pq_active = False
-                self.reset_offline_connection_sync_state()
+                self.connection_direction = None
+                self.reset_one_to_one_e2e()
+                self.current_peer_addr = None
                 self.current_peer_dest_b64 = None
                 self.post("disconnect", "Peer disconnected.")
                 self.peer_b32 = "Waiting for incoming connections..."
@@ -4438,10 +4697,13 @@ class TermchatI2P(App):
                         self.current_peer_dest_b64 = None
                         self.peer_b32 = "Waiting for incoming connections..."
                         self.clear_tofu_runtime_status()
+                        self.connection_direction = None
+                        self.reset_one_to_one_e2e()
 
-                        if self.pending_incoming_task:
-                            self.pending_incoming_task.cancel()
-                            self.pending_incoming_task = None
+                        pending_task = self.pending_incoming_task
+                        self.pending_incoming_task = None
+                        if pending_task and pending_task is not asyncio.current_task():
+                            pending_task.cancel()
 
                         if writer is not None:
                             try:
@@ -4453,6 +4715,7 @@ class TermchatI2P(App):
                         self.post("system", f"Incoming caller disconnected: {caller[:12]}...")
                         return
 
+                    self.invalidate_one_to_one_connect(cancel=True)
                     self.post("system", "Peer requested disconnect.")
                     return
 
@@ -6527,16 +6790,18 @@ class TermchatI2P(App):
 
 
     async def disconnect_peer(self):
+        cancelled_attempt = self.invalidate_one_to_one_connect(cancel=True)
+        self.connection_direction = None
+
         if self.conn:
             reader, writer = self.conn
             
             self.reset_transfer_state()
             
             self.conn = None
-            self.live_ready = False
-            self.pq_active = False
-            self.reset_offline_connection_sync_state()
+            self.reset_one_to_one_e2e()
             self.stop_heartbeat()
+            self.current_peer_addr = None
             self.current_peer_dest_b64 = None
             self.peer_b32 = "Waiting for incoming connections..."
             self.clear_tofu_runtime_status()
@@ -6555,6 +6820,17 @@ class TermchatI2P(App):
             self.post("disconnect", "You disconnected.")
             self.post("system", "Waiting for incoming connections...")
 
+        elif cancelled_attempt:
+            self.reset_one_to_one_e2e()
+            self.current_peer_addr = None
+            self.current_peer_dest_b64 = None
+            self.peer_b32 = "Waiting for incoming connections..."
+            self.clear_tofu_runtime_status()
+            self.watch_peer_b32(self.peer_b32)
+            self.update_command_bar()
+            self.post("disconnect", "Connection attempt cancelled.")
+            self.post("system", "Waiting for incoming connections...")
+
  
 
 
@@ -6571,6 +6847,9 @@ class TermchatI2P(App):
             self.save_offline_state()
         except:
             pass
+
+        self.invalidate_one_to_one_connect(cancel=True)
+        self.connection_direction = None
 
         runtime = self.sam_runtime
         if runtime:
