@@ -3,7 +3,7 @@
 
 The reason for this decision is simple: our architectural model is now mature enough to be implemented in a more rigorous and secure language, such as Rust. While Termchat-i2p featured a highly secure architectural design, it lacked ironclad security due to its Python implementation and the inherent vulnerabilities associated with that language.
 
-Consequently, we have completely shifted our development to Rust. We are now focusing our efforts on **CommTools-I2P**, a unified Rust crate API that supports terminal, desktop, and mobile implementations.
+Consequently, we have completely shifted our development to Rust. We are now focusing our efforts on [CommTools-I2P](https://github.com/stanley-i2p/commtools-i2p), a unified Rust crate API that supports terminal, desktop, and mobile implementations.
 
 ## Termchat-I2P
 
